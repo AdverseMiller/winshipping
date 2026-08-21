@@ -59,7 +59,7 @@ Highlights are reconciled every 500 ms because their component data persists aft
 
 In a live 16-player read-only comparison, the original 1 ms full-scan loop averaged about 2.5% of one host CPU after attachment. The optimized idle loop averaged about 0.2% under the same bounded measurement. A cold protected-DTB recovery still performs the physical scan once, but a subsequent validated cache hit reduced a four-second launch sample from 23% average CPU to 1%.
 
-The actor scan remains read-only. Player states marked by `APlayerState::bIsABot` are discarded before pawn resolution, so bots never enter the printed snapshot or targeting candidates. Aim candidates are also rejected unless `UWorld::Seconds - USkinnedMeshComponent::LastRenderTime <= 0.06`; this visibility filter affects targeting only and does not hide entries from the actor-position printout. Holding the right mouse button (`VK_RBUTTON`) activates the targeting prototype, which acquires the nearest visible enemy within a 30-degree camera cone and retains that pawn until right-click is released. Through 50 meters, bone resolution requests head index `110`; beyond 50 meters it requests torso index `3`. The requested index is tried directly and validated relative to the skeletal-mesh component rather than the pawn root, with geometric scanning used only when that transform is unavailable. Resolution prefers the array at `Mesh + 0x648` and falls back to `Mesh + 0x658`; failure skips the pawn rather than using its capsule. The target delta is calculated relative to the decoded camera, divided by the effective smoothing value, and written through `APlayerController::RotationInput`. A configured held-weapon override is selected first, then the vehicle value, then ordinary smoothing. `RotationInput` is cleared while idle, on shutdown, and when the controller changes. Every smoothing value must be at least `1`; ordinary smoothing defaults to `11`.
+The actor scan remains read-only. Player states marked by `APlayerState::bIsABot` are discarded before pawn resolution, so bots never enter the printed snapshot or targeting candidates. Aim candidates are also rejected unless `UWorld::Seconds - USkinnedMeshComponent::LastRenderTime <= 0.06`; this visibility filter affects targeting only and does not hide entries from the actor-position printout. Holding the right mouse button (`VK_RBUTTON`) activates the targeting prototype, which acquires the nearest visible enemy within a 30-degree camera cone and retains that pawn until right-click is released. Through 50 meters, bone resolution requests head index `110`; beyond 50 meters it requests torso index `3`. The requested index is tried directly and validated relative to the skeletal-mesh component rather than the pawn root, with geometric scanning used only when that transform is unavailable. Resolution prefers the array at `Mesh + 0x660` and falls back to `Mesh + 0x670`; failure skips the pawn rather than using its capsule. The target delta is calculated relative to the decoded camera, divided by the effective smoothing value, and written through `APlayerController::RotationInput`. A configured held-weapon override is selected first, then the vehicle value, then ordinary smoothing. `RotationInput` is cleared while idle, on shutdown, and when the controller changes. Every smoothing value must be at least `1`; ordinary smoothing defaults to `11`.
 
 Holding `U` (`VK_U`) activates llama targeting and takes priority over right-click targeting. It resolves `MapInfo::LlamaClass`, caches exact-class actors from the loaded level arrays, selects the llama nearest to the active camera, and retains it until `U` is released. Camera-relative selection remains accurate while riding the battlebus, where the pawn root may not follow the aircraft. This route intentionally ignores mesh visibility and the normal camera-cone limit. Its smoothing is fixed at `1.0`, independent of `--smoothing`.
 
@@ -83,15 +83,16 @@ live validation.
 
 | Value | Offset |
 |---|---:|
-| `GEngine` | `0x1A655088` |
+| direct `UWorld` global | `0x1B156318` (supplied, diagnostic only) |
+| `GEngine` | `0x1B157C88` |
 | `UGameEngine::GameViewport` | `0xB70` |
 | `UGameViewportClient::World` | `0x78` (unverified carry-forward) |
-| `UWorld::GameState` | `0x1C8` |
-| `UWorld::OwningGameInstance` | `0x240` |
-| world camera-location pointer | `0x170` |
-| world encoded-camera-rotation pointer | `0x180` |
-| `UWorld::Seconds` | `0x190` |
-| `UWorld::Levels` | `0x1E0` |
+| `UWorld::GameState` | `0x1C0` |
+| `UWorld::OwningGameInstance` | `0x238` |
+| world camera-location pointer | `0x168` |
+| world encoded-camera-rotation pointer | `0x178` |
+| `UWorld::Seconds` | `0x188` |
+| `UWorld::Levels` | `0x1D8` |
 | `AGameStateBase::PlayerArray` | `0x288` |
 | `AGameStateAthena::MapInfo` | `0x2088` |
 | `AAthenaMapInfo::LlamaClass` | `0x3D0` |
@@ -102,46 +103,46 @@ live validation.
 | `AController::ControlRotation` | `0x2E8` |
 | `APlayerController::NetConnection` | `0x4A8` |
 | `APlayerController::RotationInput` | `0x4B0` |
-| `APlayerController::PlayerAimOffset` | `0x2230` |
-| `APlayerController::WeaponRecoilOffset` | `0x2248` |
-| `APlayerController::WeaponOffsetCorrection` | `0x2260` |
-| `APlayerCameraManager::CameraCachePrivate` | `0x1590` |
+| `APlayerController::PlayerAimOffset` | `0x2310` |
+| `APlayerController::WeaponRecoilOffset` | `0x2328` |
+| `APlayerController::WeaponOffsetCorrection` | `0x2340` |
+| `APlayerCameraManager::CameraCachePrivate` | `0x1590` (unverified carry-forward) |
 | `APlayerState::PawnPrivate` | `0x2E8` |
 | `APlayerState::bIsABot` | `0x27A`, bit 3 |
-| `APlayerStateAthena::TeamIndex` | `0xF31` |
+| `APlayerStateAthena::TeamIndex` | `0xF61` |
 | `AActor::RootComponent` | `0x1B0` |
 | live protected `UObject::ClassPrivate` | `0x20` |
-| `ULevel::Actors` | `0xA8` |
+| `ULevel::Actors` | `0x38` |
 | `APickup::bPickedUp` | `0x28C`, bit 2 |
 | `APickup::PrimaryPickupItemEntry` | `0x368` |
 | `FItemEntry::ItemDefinition` | `0x10` |
 | `UItemDefinitionBase::ItemName` | `0x38` |
-| `APickupEffect::ParentPickupActor` | `0x290` |
-| `APickupsParent::PickupRarityLevel` | `0x374` |
-| `APawn::CurrentWeapon` | `0x998` |
-| `APlayerPawn::CurrentVehicle` | `0x2B00` |
-| `AWeapon::WeaponData` | `0x630` |
+| `APickupEffect::ParentPickupActor` | `0x290` (unverified carry-forward) |
+| `APickupsParent::PickupRarityLevel` | `0x374` (unverified carry-forward) |
+| `APawn::CurrentWeapon` | `0x9A0` |
+| `APlayerPawn::CurrentVehicle` | `0x2B00` (unverified carry-forward) |
+| `AWeapon::WeaponData` | `0x648` |
 | SDK `FTextData` string pointer / length | `0x28` / `0x30` |
 | legacy live `FTextData` fallback pointer / length | `0x20` / `0x28` |
 | `APlayerPawn::Mesh` | `0x2F0` |
-| `APlayerPawnAthena::CustomDepthComponent` | `0x4A08` |
-| `UPawnComponent_CustomDepth::DefaultHighlightingData` | `0xF0` |
+| `APlayerPawnAthena::CustomDepthComponent` | `0x4A08` (unverified carry-forward) |
+| `UPawnComponent_CustomDepth::DefaultHighlightingData` | `0xF0` (unverified carry-forward) |
 | mesh `ComponentToWorld` | `0x1E0` |
-| primary bone-array pointer | `0x648` |
-| cached bone-array pointer | `0x658` |
+| primary bone-array pointer | `0x660` |
+| cached bone-array pointer | `0x670` |
 | `USceneComponent::RelativeLocation` | `0x140` |
-| mesh `LastRenderTime` | `0x328` |
+| mesh `LastRenderTime` | `0x290` |
 
 `FVector` is three 64-bit floating-point values in this SDK. The viewport is resolved once through `GEngine -> GameViewport`; each refresh reads its current `World`, then follows `GameState -> PlayerArray -> PawnPrivate -> RootComponent -> RelativeLocation`. The obsolete direct-GWorld fallback was deliberately removed because its old RVA can resolve unrelated memory after an update. The terminal is rewritten with the available pawn positions.
 
-The preferred live camera path uses the pointers at `UWorld + 0x170` and `UWorld + 0x180` for location and encoded rotation. Encoded rotation values are read at `0x0`, `0x20`, and `0x1D0`, then decoded with `pitch = asin(c)` and `yaw = atan2(-a, b)`. The ordinary camera-cache/controller fields remain unverified fallbacks.
+The preferred live camera path uses the pointers at `UWorld + 0x168` and `UWorld + 0x178` for location and encoded rotation. Encoded rotation values are read at `0x0`, `0x20`, and `0x1D0`, then decoded with `pitch = asin(c)` and `yaw = atan2(-a, b)`. The ordinary camera-cache/controller fields remain unverified fallbacks.
 
 A read-only ground-loot pass decoded 95 pickups through `APickup -> PrimaryPickupItemEntry -> ItemDefinition -> ItemName`, including an exact `Lawless Stink Rifle` actor and position. A second live pass correlated pickup-effect actors through `ParentPickupActor` and validated rarity values `0` through `3` against common ammo, uncommon, rare, and epic weapons. The current SDK places the final `FTextData` string pointer and length at `0x28/0x30`; the decoder tries that layout first and retains the previously live-validated `0x20/0x28` layout as a checked fallback for carried-over objects.
 
-Held-weapon classification follows `APawn::CurrentWeapon -> AWeapon::WeaponData -> UItemDefinitionBase::ItemName`. The current live layout moved `WeaponData` from the older SDK value `0x618` to `0x630`; the supplied offset was validated read-only against both a pickaxe and a Storm Scout Sniper Rifle. The old `WeaponCoreAnimation` location returned `Melee(0)` for both firearms and is no longer used. The readable item name is grouped into pistol, shotgun, rifle, SMG, sniper, launcher, bow, minigun, melee, or unknown categories. Although the SDK also defines a semantic `EWeaponType`, no current weapon or weapon-definition member stores that enum directly, so the program does not guess a nonexistent field offset.
+Held-weapon classification follows `APawn + 0x9A0 -> AWeapon + 0x648 -> UItemDefinitionBase::ItemName`. The readable item name is grouped into pistol, shotgun, rifle, SMG, sniper, launcher, bow, minigun, melee, or unknown categories. Although the SDK also defines a semantic `EWeaponType`, no current weapon or weapon-definition member stores that enum directly, so the program does not guess a nonexistent field offset.
 
 ## Bone validation
 
-The bone resolver intentionally does not consume generated SDK class metadata. A live read-only probe confirmed that `Mesh + 0x648` and `Mesh + 0x658` both contain valid, distinct transform-array pointers. Each entry is a `0x60`-byte `FTransform`, and applying `Mesh + 0x1E0` (`ComponentToWorld`) produces plausible world coordinates across multiple human pawns. The two arrays can differ slightly during movement, consistent with current/cache pose buffers; resolution should prefer `0x648` and use `0x658` only as a fallback.
+The bone resolver intentionally does not consume generated SDK class metadata. The supplied current offsets place the pose arrays at `Mesh + 0x660` and `Mesh + 0x670`. Each entry is expected to remain a `0x60`-byte `FTransform`, with `Mesh + 0x1E0` providing `ComponentToWorld`; live validation is still required before treating the carried-forward transform layout and bone indices as confirmed for this build. Resolution prefers `0x660` and uses `0x670` only as a fallback.
 
 The probe also established geometric landmarks without assigning SDK names: index `0` was approximately 75 units below the capsule origin, index `3` approximately 20-25 units above it, and index `110` tracked the anatomical head across the sampled pawns. Runtime poses can move the mesh substantially away from the capsule origin, so head validation is anchored to `ComponentToWorld` and does not require the head to remain above the pawn root.

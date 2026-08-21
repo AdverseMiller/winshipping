@@ -323,8 +323,8 @@ std::optional<Arguments> parseArguments(int argc, char** argv) {
 }
 
 const char* boneSourceName(Unreal::BoneArraySource source) {
-    if (source == Unreal::BoneArraySource::Primary) return "mesh+0x648";
-    return "mesh+0x658";
+    if (source == Unreal::BoneArraySource::Primary) return "mesh+0x660";
+    return "mesh+0x670";
 }
 
 bool validPrimaryModule(ProcessInstance<>& process, std::uint64_t imageBase) {
