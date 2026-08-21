@@ -38,7 +38,7 @@ Pass `--ignore-isabot` to include AI-controlled match participants in actor outp
 
 Pass `--ignore-teams` to allow aim selection and chams to consider pawns on the local team. The local pawn itself remains excluded. Team filtering remains enabled by default.
 
-Pass `--chams` to apply the engine's pawn custom-depth highlight to eligible player pawns. It uses `UPawnComponent_CustomDepth::DefaultHighlightingData`, preserves unrelated flag bits, and sets all three affiliation slots to the original constant profile `12`. Chams do not use the render-timestamp visibility test, have no distance limit, and use the same bot and team filters as aim. Original component data is cached once and restored when a pawn leaves the eligible set or the program exits. `--read-only` suppresses all highlight writes.
+Pass `--chams` to apply the engine's pawn custom-depth highlight to eligible player pawns. It enables `UPawnComponent_CustomDepth`, sets all three affiliation slots to the original constant profile `12`, and forces that stencil and custom-depth bit onto the pawn's primary mesh. Chams do not use the render-timestamp visibility test, have no distance limit, and use the same bot and team filters as aim. Original component and mesh data is cached once and restored when a pawn leaves the eligible set or the program exits. `--read-only` suppresses all highlight writes.
 
 The five closest resolved pawns are printed by default, sorted by three-dimensional distance from the local pawn and excluding the local pawn itself. Pass `--print-actors` to expand the table to every resolved pawn.
 
@@ -55,7 +55,7 @@ The attach path implements both local patches:
 
 The monitor uses separate rates for input, world data, highlighting, vehicle state, weapon state, and terminal output. The idle loop polls one complete memflow keyboard snapshot every 8 ms rather than issuing one guest read per key. Player/world data refreshes every 16 ms, but stable `GEngine -> GameViewport` state is memoized and per-player fields are gathered with scatter reads. When configured, `CurrentVehicle` and `CurrentWeapon` refresh independently every 100 ms. Held-weapon detection performs the direct `CurrentWeapon -> WeaponData -> ItemName` reads only at that rate. The active aim loop runs every 4 ms and reuses the latest actor, vehicle, and weapon state; when no aim key is held, it performs no camera, visibility, or bone reads. A snapshot older than 100 ms is discarded and any active aim state is cleared rather than targeting stale objects.
 
-Highlights are reconciled every 500 ms because their component data persists after being applied. Ground-loot actors refresh every two seconds; actor classification, successful and failed item definitions, normalized item names, pickup-effect rarity values, and negative non-pickup results are cached. Initial and expired ground-actor classification is limited to 32 actors per world refresh so thousands of unrelated virtual reads cannot form one guest-stalling burst. Newly loaded actors enter that bounded queue immediately, while negative entries are revalidated after 30 seconds and removed when their actor leaves the loaded levels. Rarity fields are added to the same small scatter batch only when `--rarity` is active.
+Highlights are reconciled every 16 ms because the game can clear the primary mesh's custom-depth bit after it is written. Ground-loot actors refresh every two seconds; actor classification, successful and failed item definitions, normalized item names, pickup-effect rarity values, and negative non-pickup results are cached. Initial and expired ground-actor classification is limited to 32 actors per world refresh so thousands of unrelated virtual reads cannot form one guest-stalling burst. Newly loaded actors enter that bounded queue immediately, while negative entries are revalidated after 30 seconds and removed when their actor leaves the loaded levels. Rarity fields are added to the same small scatter batch only when `--rarity` is active.
 
 In a live 16-player read-only comparison, the original 1 ms full-scan loop averaged about 2.5% of one host CPU after attachment. The optimized idle loop averaged about 0.2% under the same bounded measurement. A cold protected-DTB recovery still performs the physical scan once, but a subsequent validated cache hit reduced a four-second launch sample from 23% average CPU to 1%.
 
@@ -125,8 +125,11 @@ live validation.
 | SDK `FTextData` string pointer / length | `0x28` / `0x30` |
 | legacy live `FTextData` fallback pointer / length | `0x20` / `0x28` |
 | `APlayerPawn::Mesh` | `0x2F0` |
-| `APlayerPawnAthena::CustomDepthComponent` | `0x4A08` (unverified carry-forward) |
-| `UPawnComponent_CustomDepth::DefaultHighlightingData` | `0xF0` (unverified carry-forward) |
+| `APlayerPawnAthena::CustomDepthComponent` | `0x4AF8` |
+| `UPawnComponent_CustomDepth::bEnableRenderCustomDepth` | `0xD0`, bit 0 |
+| `UPawnComponent_CustomDepth::DefaultHighlightingData` | `0xF0` |
+| `UPrimitiveComponent::bRenderCustomDepth` | `0x291`, bit 2 |
+| `UPrimitiveComponent::CustomDepthStencilValue` | `0x2A4` |
 | mesh `ComponentToWorld` | `0x1E0` |
 | primary bone-array pointer | `0x660` |
 | cached bone-array pointer | `0x670` |
@@ -140,6 +143,8 @@ The preferred live camera path uses the pointers at `UWorld + 0x168` and `UWorld
 A read-only ground-loot pass decoded 95 pickups through `APickup -> PrimaryPickupItemEntry -> ItemDefinition -> ItemName`, including an exact `Lawless Stink Rifle` actor and position. A second live pass correlated pickup-effect actors through `ParentPickupActor` and validated rarity values `0` through `3` against common ammo, uncommon, rare, and epic weapons. The current SDK places the final `FTextData` string pointer and length at `0x28/0x30`; the decoder tries that layout first and retains the previously live-validated `0x20/0x28` layout as a checked fallback for carried-over objects.
 
 Held-weapon classification follows `APawn + 0x9A0 -> AWeapon + 0x648 -> UItemDefinitionBase::ItemName`. The readable item name is grouped into pistol, shotgun, rifle, SMG, sniper, launcher, bow, minigun, melee, or unknown categories. Although the SDK also defines a semantic `EWeaponType`, no current weapon or weapon-definition member stores that enum directly, so the program does not guess a nonexistent field offset.
+
+The current custom-depth pointer was recovered from the supplied `ReviveFromDBNOTime` anchor. That field moved from `0x4988` to `0x4A78` (`+0xF0`); preserving the reflected `+0x80` spacing to `CustomDepthComponent` predicts `0x4AF8`. A read-only live pass then confirmed `Pawn + 0x4AF8` across 117 instantiated pawns: every pointer had the same component class, and the highlighting payload and matched-component array remained valid at component offsets `0xF0` and `0xF8`. The component's old plain `Outer == pawn` invariant no longer holds in this protected layout, so runtime validation now checks component class consistency instead. A live match exposed that the component enable flag is normally clear and that changing only `DefaultHighlightingData` no longer propagates profile 12 to the mesh. The working path now also forces `bEnableRenderCustomDepth`, the primary mesh stencil, and the mesh custom-depth bit; the latter is refreshed because the game may clear it during normal mesh updates.
 
 ## Bone validation
 

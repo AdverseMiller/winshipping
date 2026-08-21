@@ -78,8 +78,14 @@ struct HighlightingData {
 
 struct CachedHighlight {
     std::uint64_t component;
+    std::uint8_t originalComponentFlags;
+    std::uint8_t appliedComponentFlags;
     HighlightingData original;
     HighlightingData applied;
+    std::uint64_t mesh;
+    std::uint8_t originalMeshFlags;
+    std::uint8_t appliedMeshFlags;
+    std::int32_t originalMeshStencil;
 };
 
 struct CameraView {
@@ -91,8 +97,11 @@ static_assert(sizeof(Transform) == 0x60);
 static_assert(sizeof(HighlightingData) == 8);
 
 constexpr std::uint8_t ShouldHighlightMask = 1U << 0;
+constexpr std::uint8_t CustomDepthEnabledMask = 1U << 0;
+constexpr std::uint8_t RenderCustomDepthMask = 1U << 2;
 constexpr std::uint8_t PlayerHighlightStencil = 12;
 std::unordered_map<std::uint64_t, CachedHighlight> cachedHighlights;
+std::uint64_t cachedHighlightComponentClass = 0;
 
 bool plausiblePointer(std::uint64_t address) {
     return address >= 0x10000 && address <= 0x00007FFFFFFFFFFF && (address & 0x7) == 0;
@@ -278,13 +287,41 @@ HighlightingData playerHighlight(const HighlightingData& original) {
 
 bool restoreCachedHighlight(ProcessInstance<>& memory, std::uint64_t pawn, const CachedHighlight& cached) {
     const auto component = read<std::uint64_t>(memory, pawn + Offsets::PlayerPawnCustomDepthComponent);
-    if (!component.has_value() || *component != cached.component) return false;
-    const auto current = read<HighlightingData>(memory, cached.component + Offsets::CustomDepthDefaultHighlightingData);
-    if (!current.has_value()) return false;
-    if (!matchingHighlight(*current, cached.applied)) return true;
-    if (!write(memory, cached.component + Offsets::CustomDepthDefaultHighlightingData, cached.original)) return false;
-    const auto verify = read<HighlightingData>(memory, cached.component + Offsets::CustomDepthDefaultHighlightingData);
-    return verify.has_value() && matchingHighlight(*verify, cached.original);
+    const auto mesh = read<std::uint64_t>(memory, pawn + Offsets::PlayerPawnMesh);
+    if (!component.has_value() || *component != cached.component || !mesh.has_value() || *mesh != cached.mesh) return false;
+
+    bool restored = true;
+    const auto currentComponentFlags = read<std::uint8_t>(memory, cached.component + Offsets::CustomDepthEnabledFlags);
+    if (!currentComponentFlags.has_value()) restored = false;
+    else if (*currentComponentFlags == cached.appliedComponentFlags && !write(memory, cached.component + Offsets::CustomDepthEnabledFlags, cached.originalComponentFlags)) restored = false;
+
+    const auto currentHighlight = read<HighlightingData>(memory, cached.component + Offsets::CustomDepthDefaultHighlightingData);
+    if (!currentHighlight.has_value()) restored = false;
+    else if (matchingHighlight(*currentHighlight, cached.applied) && !write(memory, cached.component + Offsets::CustomDepthDefaultHighlightingData, cached.original)) restored = false;
+
+    const auto currentStencil = read<std::int32_t>(memory, cached.mesh + Offsets::PrimitiveCustomDepthStencilValue);
+    if (!currentStencil.has_value()) restored = false;
+    else if (*currentStencil == PlayerHighlightStencil && !write(memory, cached.mesh + Offsets::PrimitiveCustomDepthStencilValue, cached.originalMeshStencil)) restored = false;
+
+    const auto currentMeshFlags = read<std::uint8_t>(memory, cached.mesh + Offsets::PrimitiveRenderCustomDepthFlags);
+    if (!currentMeshFlags.has_value()) restored = false;
+    else if (*currentMeshFlags == cached.appliedMeshFlags && !write(memory, cached.mesh + Offsets::PrimitiveRenderCustomDepthFlags, cached.originalMeshFlags)) restored = false;
+    return restored;
+}
+
+bool applyCachedHighlight(ProcessInstance<>& memory, const CachedHighlight& cached) {
+    const std::uint8_t disabledMeshFlags = cached.appliedMeshFlags & static_cast<std::uint8_t>(~RenderCustomDepthMask);
+    if (!write(memory, cached.component + Offsets::CustomDepthEnabledFlags, cached.appliedComponentFlags)) return false;
+    if (!write(memory, cached.component + Offsets::CustomDepthDefaultHighlightingData, cached.applied)) return false;
+    if (!write(memory, cached.mesh + Offsets::PrimitiveRenderCustomDepthFlags, disabledMeshFlags)) return false;
+    if (!write(memory, cached.mesh + Offsets::PrimitiveCustomDepthStencilValue, static_cast<std::int32_t>(PlayerHighlightStencil))) return false;
+    if (!write(memory, cached.mesh + Offsets::PrimitiveRenderCustomDepthFlags, cached.appliedMeshFlags)) return false;
+
+    const auto componentFlags = read<std::uint8_t>(memory, cached.component + Offsets::CustomDepthEnabledFlags);
+    const auto highlight = read<HighlightingData>(memory, cached.component + Offsets::CustomDepthDefaultHighlightingData);
+    const auto meshFlags = read<std::uint8_t>(memory, cached.mesh + Offsets::PrimitiveRenderCustomDepthFlags);
+    const auto meshStencil = read<std::int32_t>(memory, cached.mesh + Offsets::PrimitiveCustomDepthStencilValue);
+    return componentFlags.has_value() && *componentFlags == cached.appliedComponentFlags && highlight.has_value() && matchingHighlight(*highlight, cached.applied) && meshFlags.has_value() && *meshFlags == cached.appliedMeshFlags && meshStencil.has_value() && *meshStencil == PlayerHighlightStencil;
 }
 
 bool plausibleTransform(const Transform& transform) {
@@ -1089,7 +1126,9 @@ HighlightResult updatePlayerHighlights(ProcessInstance<>& memory, const ActorSna
         const auto eligible = eligiblePawns.find(iterator->first);
         if (eligible != eligiblePawns.end()) {
             const auto component = read<std::uint64_t>(memory, iterator->first + Offsets::PlayerPawnCustomDepthComponent);
-            if (component.has_value() && *component == iterator->second.component) {
+            const auto mesh = read<std::uint64_t>(memory, iterator->first + Offsets::PlayerPawnMesh);
+            if (component.has_value() && *component == iterator->second.component && mesh.has_value() && *mesh == iterator->second.mesh) {
+                if (!applyCachedHighlight(memory, iterator->second)) ++result.failed;
                 ++iterator;
                 continue;
             }
@@ -1106,25 +1145,36 @@ HighlightResult updatePlayerHighlights(ProcessInstance<>& memory, const ActorSna
             ++result.failed;
             continue;
         }
-        const auto owner = read<std::uint64_t>(memory, *component + Offsets::ObjectOuter);
+        const auto componentClass = read<std::uint64_t>(memory, *component + Offsets::ObjectClass);
+        const auto componentFlags = read<std::uint8_t>(memory, *component + Offsets::CustomDepthEnabledFlags);
         const auto original = read<HighlightingData>(memory, *component + Offsets::CustomDepthDefaultHighlightingData);
-        if (!owner.has_value() || *owner != pawn || !original.has_value()) {
+        const auto mesh = read<std::uint64_t>(memory, pawn + Offsets::PlayerPawnMesh);
+        if (!componentClass.has_value() || !plausiblePointer(*componentClass) || !componentFlags.has_value() || !original.has_value() || !mesh.has_value() || !plausiblePointer(*mesh)) {
+            ++result.failed;
+            continue;
+        }
+        if (cachedHighlightComponentClass == 0) cachedHighlightComponentClass = *componentClass;
+        if (*componentClass != cachedHighlightComponentClass) {
             ++result.failed;
             continue;
         }
 
         const HighlightingData applied = playerHighlight(*original);
-        if (!write(memory, *component + Offsets::CustomDepthDefaultHighlightingData, applied)) {
+        const auto meshFlags = read<std::uint8_t>(memory, *mesh + Offsets::PrimitiveRenderCustomDepthFlags);
+        const auto meshStencil = read<std::int32_t>(memory, *mesh + Offsets::PrimitiveCustomDepthStencilValue);
+        if (!meshFlags.has_value() || !meshStencil.has_value()) {
             ++result.failed;
             continue;
         }
-        const auto verify = read<HighlightingData>(memory, *component + Offsets::CustomDepthDefaultHighlightingData);
-        if (!verify.has_value() || !matchingHighlight(*verify, applied)) {
-            write(memory, *component + Offsets::CustomDepthDefaultHighlightingData, *original);
+        const std::uint8_t appliedComponentFlags = *componentFlags | CustomDepthEnabledMask;
+        const std::uint8_t appliedMeshFlags = *meshFlags | RenderCustomDepthMask;
+        const CachedHighlight cached{*component, *componentFlags, appliedComponentFlags, *original, applied, *mesh, *meshFlags, appliedMeshFlags, *meshStencil};
+        if (!applyCachedHighlight(memory, cached)) {
+            restoreCachedHighlight(memory, pawn, cached);
             ++result.failed;
             continue;
         }
-        cachedHighlights.emplace(pawn, CachedHighlight{*component, *original, applied});
+        cachedHighlights.emplace(pawn, cached);
         ++result.applied;
     }
     result.active = cachedHighlights.size();

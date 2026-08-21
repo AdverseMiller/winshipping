@@ -14,7 +14,7 @@ inline constexpr std::string_view QemuTarget = "win-gaming";
 inline constexpr std::chrono::milliseconds DisplayInterval{200};
 inline constexpr std::chrono::milliseconds ActorRefreshInterval{16};
 inline constexpr std::chrono::milliseconds ActorSnapshotExpiry{100};
-inline constexpr std::chrono::milliseconds HighlightRefreshInterval{500};
+inline constexpr std::chrono::milliseconds HighlightRefreshInterval{16};
 inline constexpr std::chrono::milliseconds VehicleStateRefreshInterval{100};
 inline constexpr std::chrono::milliseconds WeaponStateRefreshInterval{100};
 inline constexpr std::chrono::milliseconds ActiveLoopInterval{4};
