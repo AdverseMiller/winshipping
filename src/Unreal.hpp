@@ -14,6 +14,7 @@ namespace Unreal {
 struct ActorPosition {
     std::uint64_t actor;
     std::uint64_t playerState;
+    std::uint64_t root;
     std::uint64_t mesh;
     std::uint8_t team;
     float lastRenderTime;
@@ -68,6 +69,65 @@ struct HighlightResult {
     std::size_t applied;
     std::size_t restored;
     std::size_t failed;
+};
+
+struct PlayerBox {
+    std::uint64_t actor;
+    std::uint16_t x;
+    std::uint16_t y;
+    std::uint16_t width;
+    std::uint16_t height;
+    bool visible;
+};
+
+struct PlayerBoxTarget {
+    std::uint64_t actor;
+    std::uint64_t root;
+    std::uint64_t mesh;
+    double meshLocalToRootX;
+    double meshLocalToRootY;
+    double meshLocalToRootZ;
+    double rootX;
+    double rootY;
+    double rootZ;
+    bool visible;
+    std::uint8_t missedRebuilds;
+};
+
+enum class BoxProjectionFailure : std::uint8_t {
+    None,
+    CameraUnavailable,
+    BehindCamera,
+    InvalidProjection,
+    InvalidExtent,
+    Offscreen
+};
+
+struct PlayerBoxDebug {
+    std::uint64_t actor{};
+    std::uint64_t root{};
+    std::uint64_t mesh{};
+    double rootX{};
+    double rootY{};
+    double rootZ{};
+    double minimumDepth{};
+    bool visible{};
+    bool projected{};
+    BoxProjectionFailure failure{BoxProjectionFailure::None};
+    PlayerBox box{};
+};
+
+struct BoxProjectionDebug {
+    bool cameraValid{};
+    double cameraX{};
+    double cameraY{};
+    double cameraZ{};
+    double cameraPitch{};
+    double cameraYaw{};
+    double cameraFov{};
+    std::size_t targetCount{};
+    std::size_t projectedCount{};
+    std::vector<PlayerBoxDebug> players;
 };
 
 enum class ItemRarity : std::uint8_t {
@@ -154,6 +214,10 @@ std::string_view weaponCategoryName(WeaponCategory category);
 std::optional<AimResult> aimAtNearestGroundItem(ProcessInstance<>& memory, const ActorSnapshot& snapshot, const GroundItemSnapshot& items, bool activationDown);
 HighlightResult updatePlayerHighlights(ProcessInstance<>& memory, const ActorSnapshot& snapshot, bool enabled, bool ignoreTeams = false);
 HighlightResult restorePlayerHighlights(ProcessInstance<>& memory);
+std::vector<PlayerBoxTarget> playerBoxTargets(ProcessInstance<>& memory, const ActorSnapshot& snapshot, const std::vector<PlayerBoxTarget>& previousTargets, bool ignoreTeams = false);
+bool refreshPlayerBoxTargets(ProcessInstance<>& memory, std::vector<PlayerBoxTarget>& targets, double worldSeconds);
+std::vector<PlayerBox> projectPlayerBoxes(ProcessInstance<>& memory, const ActorSnapshot& snapshot, const std::vector<PlayerBoxTarget>& targets, std::uint16_t screenWidth, std::uint16_t screenHeight, BoxProjectionDebug* debug = nullptr);
+std::string_view boxProjectionFailureName(BoxProjectionFailure failure);
 bool clearAimOffsets(ProcessInstance<>& memory, std::uint64_t world);
 std::vector<BoneSnapshot> probeBones(ProcessInstance<>& memory, const ActorSnapshot& snapshot);
 

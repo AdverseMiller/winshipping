@@ -34,11 +34,31 @@ Pass `--vehicle-smoothing FLOAT` to use a separate normal-aim smoothing value wh
 
 Pass repeatable `--weapon-smoothing TYPE=FLOAT` options to override normal-aim smoothing for the weapon currently held. For example, `--weapon-smoothing rifle=7 --weapon-smoothing shotgun=3 --weapon-smoothing sniper=12` leaves every unspecified weapon on the ordinary on-foot or vehicle value. Supported types are `pistol`, `shotgun`, `rifle`, `smg`, `sniper`, `launcher`, `bow`, `minigun`, `melee`, `utility`, `unarmed`, and `unknown`; `other` is accepted as an alias for `unknown`. If the same type appears more than once, the last value wins. A weapon override takes precedence over `--vehicle-smoothing` because it is more specific. Detection and its extra reads are disabled unless at least one weapon override is configured.
 
-Pass `--ignore-isabot` to include AI-controlled match participants in actor output, aim selection, and chams. Without it, every player state marked by `APlayerState::bIsABot` is filtered, including fully functional match bots rather than only creative-map dummy pawns.
+Pass `--ignore-isabot` to include AI-controlled match participants in actor output, aim selection, chams, and boxes. Without it, every player state marked by `APlayerState::bIsABot` is filtered, including fully functional match bots rather than only creative-map dummy pawns.
 
-Pass `--ignore-teams` to allow aim selection and chams to consider pawns on the local team. The local pawn itself remains excluded. Team filtering remains enabled by default.
+Pass `--ignore-teams` to allow aim selection, chams, and boxes to consider pawns on the local team. The local pawn itself remains excluded. Team filtering remains enabled by default.
 
 Pass `--chams` to apply the engine's pawn custom-depth highlight to eligible player pawns. It enables `UPawnComponent_CustomDepth`, sets all three affiliation slots to the original constant profile `12`, and forces that stencil and custom-depth bit onto the pawn's primary mesh. Chams do not use the render-timestamp visibility test, have no distance limit, and use the same bot and team filters as aim. Original component and mesh data is cached once and restored when a pawn leaves the eligible set or the program exits. `--read-only` suppresses all highlight writes.
+
+Pass `--boxes` as a mutually exclusive alternative to `--chams`. It projects each eligible pawn's validated head and root positions through the decoded live camera and streams clipped rectangle outlines to the host BAR1 renderer. Visible targets are green and occluded targets are red according to the same `LastRenderTime` predicate used by aim. The guest has no overlay process, injected module, graphics hook, or pixel-restoration step: the host identifies the target process's resident WDDM scanout allocations, correlates them with the active hardware plane, and writes only the submitted outlines into those allocations. Startup briefly pauses the VM for a consistent ownership/mapping snapshot and resumes it before any frames are drawn. The current configured projection size is 1920x1080; a resolution change requires updating `BoxScreenWidth` and `BoxScreenHeight` in `src/Config.hpp` to match the discovered scanout geometry.
+
+Add `--debug` alongside `--boxes` to replace the normal terminal dashboard with one-second diagnostic snapshots. They report actor/anchor refresh failures, camera failures, empty projection frames, atomic pipe drops, camera state, and each target's world anchor, minimum camera depth, visibility state, projected rectangle, or rejection reason.
+
+Box geometry and camera reprojection remain capped at 360 Hz. The renderer keeps
+the latest geometry in native A2B10G10R10 form and repaints the three cached
+backbuffers at 2 kHz by default. Pass `--hz HZ` to override the repaint rate;
+raising it does not increase memflow reads or projection work. Each colored
+outline has a two-pixel opaque-black outer edge for contrast without changing
+the visible/occluded colors.
+
+Player rectangles come from a stable world-space capsule centered on the actor
+root rather than doubling the vertical screen-space difference between a head
+bone and the root. Eight capsule-bound corners are projected, and only the
+resulting width and height receive a short 20 ms smoothing filter. This avoids
+the head/root projection collapsing under steep viewing angles while leaving
+the current screen-space center responsive to camera motion. A plausible live
+head bone is still required as an eligibility check so dormant replicated
+player records without an instantiated renderable mesh do not receive boxes.
 
 The five closest resolved pawns are printed by default, sorted by three-dimensional distance from the local pawn and excluding the local pawn itself. Pass `--print-actors` to expand the table to every resolved pawn.
 
@@ -53,7 +73,9 @@ The attach path implements both local patches:
 
 ## Runtime performance
 
-The monitor uses separate rates for input, world data, highlighting, vehicle state, weapon state, and terminal output. The idle loop polls one complete memflow keyboard snapshot every 8 ms rather than issuing one guest read per key. Player/world data refreshes every 16 ms, but stable `GEngine -> GameViewport` state is memoized and per-player fields are gathered with scatter reads. When configured, `CurrentVehicle` and `CurrentWeapon` refresh independently every 100 ms. Held-weapon detection performs the direct `CurrentWeapon -> WeaponData -> ItemName` reads only at that rate. The active aim loop runs every 4 ms and reuses the latest actor, vehicle, and weapon state; when no aim key is held, it performs no camera, visibility, or bone reads. A snapshot older than 100 ms is discarded and any active aim state is cleared rather than targeting stale objects.
+The monitor uses separate rates for input, world data, highlighting, vehicle state, weapon state, box projection, and terminal output. The idle loop polls one complete memflow keyboard snapshot every 8 ms rather than issuing one guest read per key. Full PlayerArray/world discovery and box eligibility refresh every 16 ms, but the cached renderable targets' mesh transforms and visibility timestamps refresh in one lightweight scatter batch every 4 ms. Box eligibility uses the validated actor root and mesh identity rather than a skeletal head transform, because distant skeletal LOD updates can temporarily withhold bone data. Rebuilds merge into the existing target cache and tolerate up to eight missed 16 ms snapshots before expiry; local/team filtering and root/mesh identity changes still remove a target immediately. Each target calibrates the stable actor-root offset from the skeletal mesh's live `ComponentToWorld` translation and uses the slower replicated root only as a fallback. Stable `GEngine -> GameViewport` state is memoized and per-player fields are gathered with scatter reads. In `--boxes` mode, only the current camera and cached world-space anchors are reprojected at 360 Hz; bone traversal is kept out of that high-rate path. When configured, `CurrentVehicle` and `CurrentWeapon` refresh independently every 100 ms. Held-weapon detection performs the direct `CurrentWeapon -> WeaponData -> ItemName` reads only at that rate. The active aim loop runs every 4 ms and reuses the latest actor, vehicle, and weapon state; when no aim key is held and boxes are disabled, it performs no camera, visibility, or bone reads. A snapshot older than 100 ms is discarded and any active aim state is cleared rather than targeting stale objects.
+
+Existing box targets retain their mesh-local anchor and latest fast-refresh position during the 16 ms eligibility rebuild. Only a newly observed or identity-changed target performs the one-time mesh-transform calibration, preventing the slower discovery snapshot from periodically resetting live motion.
 
 Highlights are reconciled every 16 ms because the game can clear the primary mesh's custom-depth bit after it is written. Ground-loot actors refresh every two seconds; actor classification, successful and failed item definitions, normalized item names, pickup-effect rarity values, and negative non-pickup results are cached. Initial and expired ground-actor classification is limited to 32 actors per world refresh so thousands of unrelated virtual reads cannot form one guest-stalling burst. Newly loaded actors enter that bounded queue immediately, while negative entries are revalidated after 30 seconds and removed when their actor leaves the loaded levels. Rarity fields are added to the same small scatter batch only when `--rarity` is active.
 
@@ -61,7 +83,7 @@ In a live 16-player read-only comparison, the original 1 ms full-scan loop avera
 
 The actor scan remains read-only. Player states marked by `APlayerState::bIsABot` are discarded before pawn resolution, so bots never enter the printed snapshot or targeting candidates. Aim candidates are also rejected unless `UWorld::Seconds - USkinnedMeshComponent::LastRenderTime <= 0.06`; this visibility filter affects targeting only and does not hide entries from the actor-position printout. Holding the right mouse button (`VK_RBUTTON`) activates the targeting prototype, which acquires the nearest visible enemy within a 30-degree camera cone and retains that pawn until right-click is released. Through 50 meters, bone resolution requests head index `110`; beyond 50 meters it requests torso index `3`. The requested index is tried directly and validated relative to the skeletal-mesh component rather than the pawn root, with geometric scanning used only when that transform is unavailable. Resolution prefers the array at `Mesh + 0x660` and falls back to `Mesh + 0x670`; failure skips the pawn rather than using its capsule. The target delta is calculated relative to the decoded camera, divided by the effective smoothing value, and written through `APlayerController::RotationInput`. A configured held-weapon override is selected first, then the vehicle value, then ordinary smoothing. `RotationInput` is cleared while idle, on shutdown, and when the controller changes. Every smoothing value must be at least `1`; ordinary smoothing defaults to `11`.
 
-Holding `U` (`VK_U`) activates llama targeting and takes priority over right-click targeting. It resolves `MapInfo::LlamaClass`, caches exact-class actors from the loaded level arrays, selects the llama nearest to the active camera, and retains it until `U` is released. Camera-relative selection remains accurate while riding the battlebus, where the pawn root may not follow the aircraft. This route intentionally ignores mesh visibility and the normal camera-cone limit. Its smoothing is fixed at `1.0`, independent of `--smoothing`.
+Holding `U` (`VK_U`) activates llama targeting and takes priority over right-click targeting. The current build protects `AGameStateAthena::MapInfo`, so the old plain `MapInfo -> LlamaClass` pointer chain is no longer used. Instead, the loaded actor graph resolves each selector-dependent class slot through the shared live `UClass` metaclass and groups positioned actors by exact class. A class must have exactly three instances, be distributed across at least 100 meters, and pass a semantic `AAthenaSupplyDrop::SpawnOffsetZ` validation: every value must be finite and bounded, with at least one positive configured spawn offset. Discovery fails closed unless exactly one class qualifies. Successful discovery is cached for ten seconds and retained across temporary world-streaming gaps. The nearest cached llama is selected relative to the active camera and retained until `U` is released, which remains accurate while riding the battlebus. This route intentionally ignores mesh visibility and the normal camera-cone limit. Its smoothing is fixed at `1.0`, independent of `--smoothing`.
 
 Pass `--item-name "NAME"` to enable ground-item targeting. The comparison is an ASCII case-insensitive substring, so `--item-name "stink rifle"` matches `Lawless Stink Rifle`. Add `--rarity RARITY` to set the minimum, case-insensitive rarity; accepted values are `Common`, `Uncommon`, `Rare`, `Epic`, `Legendary`, `Mythic`, `Transcendent`, and `Unattainable`. For example, `--item-name "shotgun" --rarity rare` includes rare, epic, legendary, mythic, transcendent, and unattainable shotguns while excluding common and uncommon ones. Rarity is resolved through the pickup effect's parent link and `APickupsParent::PickupRarityLevel`, rather than guessing from the item name or color. Loaded level actors are refreshed every two seconds, pickup metadata is cached, and the terminal reports the active name/minimum-rarity filter and current match count. Holding `Y` (`VK_Y`) selects the matching pickup nearest to the active camera and retains that actor until `Y` is released. This mode takes priority over llama and right-click targeting, ignores visibility and the normal camera-cone limit, and uses fixed smoothing `1.0`. Only pickup actors and effects replicated into the client's loaded levels can be found.
 
@@ -94,12 +116,11 @@ live validation.
 | `UWorld::Seconds` | `0x188` |
 | `UWorld::Levels` | `0x1D8` |
 | `AGameStateBase::PlayerArray` | `0x288` |
-| `AGameStateAthena::MapInfo` | `0x2088` |
-| `AAthenaMapInfo::LlamaClass` | `0x3D0` |
 | `UGameInstance::LocalPlayers` | `0x38` |
 | `UPlayer::PlayerController` | `0x30` |
 | `APlayerController::AcknowledgedPawn` | `0x318` |
 | `APlayerController::PlayerCameraManager` | `0x328` |
+| controller FOV scale (`horizontal FOV = scale * 90`) | `0x374` |
 | `AController::ControlRotation` | `0x2E8` |
 | `APlayerController::NetConnection` | `0x4A8` |
 | `APlayerController::RotationInput` | `0x4B0` |
@@ -111,7 +132,7 @@ live validation.
 | `APlayerState::bIsABot` | `0x27A`, bit 3 |
 | `APlayerStateAthena::TeamIndex` | `0xF61` |
 | `AActor::RootComponent` | `0x1B0` |
-| live protected `UObject::ClassPrivate` | `0x20` |
+| live protected `UObject` slot storage | `0x20`, four low lanes at stride `0x20` |
 | `ULevel::Actors` | `0x38` |
 | `APickup::bPickedUp` | `0x28C`, bit 2 |
 | `APickup::PrimaryPickupItemEntry` | `0x368` |

@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <string>
@@ -68,6 +70,10 @@ struct LlamaAimTarget {
     Vector3 position;
 };
 
+struct ProtectedSlotStorage {
+    std::array<std::uint8_t, 0x68> bytes{};
+};
+
 struct HighlightingData {
     std::uint8_t flags;
     std::uint8_t localPlayerStencil;
@@ -91,6 +97,7 @@ struct CachedHighlight {
 struct CameraView {
     Vector3 location;
     Rotator rotation;
+    double fov{std::numeric_limits<double>::quiet_NaN()};
 };
 
 static_assert(sizeof(Transform) == 0x60);
@@ -217,6 +224,100 @@ double normalizedAngle(double angle) {
     return std::remainder(angle, 360.0);
 }
 
+std::optional<double> resolveControllerFov(ProcessInstance<>& memory, std::uint64_t controller) {
+    if (!plausiblePointer(controller)) return std::nullopt;
+    const auto scale = read<float>(memory, controller + Offsets::CameraFov);
+    if (!scale.has_value() || !std::isfinite(*scale) || *scale < 0.25F || *scale > 4.0F) return std::nullopt;
+
+    // Fortnite stores LocalPlayerCachedLODDistanceFactor here and derives the
+    // horizontal angle by multiplying it by 90.  The live default value
+    // 0.888889 therefore resolves to the game's normal 80-degree field of view.
+    const double fov = static_cast<double>(*scale) * 90.0;
+    if (!std::isfinite(fov) || fov < 20.0 || fov > 170.0) return std::nullopt;
+    return fov;
+}
+
+std::optional<double> resolveCameraFov(ProcessInstance<>& memory, std::uint64_t manager, const Vector3& decodedLocation, const Rotator& decodedRotation) {
+    if (!plausiblePointer(manager)) return std::nullopt;
+    struct FovLayout {
+        std::uint64_t locationOffset{};
+        std::uint64_t rotationDelta{};
+        std::uint64_t fovDelta{};
+        double fov{};
+    };
+    static std::uint64_t cachedManager = 0;
+    static FovLayout cached{};
+    const auto validate = [&](const FovLayout& layout) -> std::optional<double> {
+        const auto location = read<Vector3>(memory, manager + layout.locationOffset);
+        const auto rotation = read<Rotator>(memory, manager + layout.locationOffset + layout.rotationDelta);
+        const auto fov = read<float>(memory, manager + layout.locationOffset + layout.fovDelta);
+        if (!location.has_value() || !rotation.has_value() || !fov.has_value() || !std::isfinite(*fov) || *fov < 20.0F || *fov > 170.0F) return std::nullopt;
+        const double locationError = std::hypot(std::hypot(location->x - decodedLocation.x, location->y - decodedLocation.y), location->z - decodedLocation.z);
+        const double pitchError = std::abs(normalizedAngle(rotation->pitch - decodedRotation.pitch));
+        const double yawError = std::abs(normalizedAngle(rotation->yaw - decodedRotation.yaw));
+        if (!std::isfinite(locationError) || locationError > 2.0 || pitchError > 1.0 || yawError > 1.0) return std::nullopt;
+        return *fov;
+    };
+    if (cachedManager == manager && cached.locationOffset != 0) {
+        const auto fov = validate(cached);
+        if (fov.has_value()) return fov;
+        cached = {};
+    }
+
+    std::vector<FovLayout> candidates;
+    for (std::uint64_t locationOffset = 0x100; locationOffset < 0x3000; locationOffset += 8) {
+        const auto location = read<Vector3>(memory, manager + locationOffset);
+        if (!location.has_value()) continue;
+        const double locationError = std::hypot(std::hypot(location->x - decodedLocation.x, location->y - decodedLocation.y), location->z - decodedLocation.z);
+        if (!std::isfinite(locationError) || locationError > 2.0) continue;
+        for (const auto [rotationDelta, fovDelta] : {std::pair<std::uint64_t, std::uint64_t>{0x18, 0x30}, {0x28, 0x50}}) {
+            const auto rotation = read<Rotator>(memory, manager + locationOffset + rotationDelta);
+            const auto fov = read<float>(memory, manager + locationOffset + fovDelta);
+            if (!rotation.has_value() || !fov.has_value() || !std::isfinite(*fov) || *fov < 20.0F || *fov > 170.0F) continue;
+            const double pitchError = std::abs(normalizedAngle(rotation->pitch - decodedRotation.pitch));
+            const double yawError = std::abs(normalizedAngle(rotation->yaw - decodedRotation.yaw));
+            if (pitchError > 1.0 || yawError > 1.0) continue;
+            candidates.push_back(FovLayout{locationOffset, rotationDelta, fovDelta, *fov});
+        }
+    }
+    if (candidates.empty()) return std::nullopt;
+    const double value = candidates.front().fov;
+    if (std::any_of(candidates.begin(), candidates.end(), [value](const FovLayout& candidate) { return std::abs(candidate.fov - value) >= 0.01; })) return std::nullopt;
+    cachedManager = manager;
+    cached = candidates.front();
+    return value;
+}
+
+void printFovCandidates(ProcessInstance<>& memory, std::string_view label, std::uint64_t base, std::uint64_t size) {
+    if (!plausiblePointer(base)) return;
+    std::cerr << "box FOV candidates " << label << " base=0x" << std::hex << base << std::dec << ':';
+    std::size_t printed = 0;
+    for (std::uint64_t offset = 0; offset + sizeof(float) <= size && printed < 80; offset += 4) {
+        const auto value = read<float>(memory, base + offset);
+        if (!value.has_value() || !std::isfinite(*value) || *value < 20.0F || *value > 170.0F) continue;
+        std::cerr << " +0x" << std::hex << offset << std::dec << "=" << *value;
+        ++printed;
+    }
+    std::cerr << '\n';
+}
+
+void printCameraValueCandidates(ProcessInstance<>& memory, std::uint64_t base, const Vector3& location, const Rotator& rotation) {
+    if (!plausiblePointer(base)) return;
+    std::cerr << "box camera-value candidates:";
+    for (std::uint64_t offset = 0; offset + sizeof(double) <= 0x3000; offset += 8) {
+        const auto value = read<double>(memory, base + offset);
+        if (!value.has_value() || !std::isfinite(*value)) continue;
+        const char* label = nullptr;
+        if (std::abs(*value - location.x) < 2.0) label = "lx";
+        else if (std::abs(*value - location.y) < 2.0) label = "ly";
+        else if (std::abs(*value - location.z) < 2.0) label = "lz";
+        else if (std::abs(normalizedAngle(*value - rotation.pitch)) < 0.2) label = "pitch";
+        else if (std::abs(normalizedAngle(*value - rotation.yaw)) < 0.2) label = "yaw";
+        if (label) std::cerr << " +0x" << std::hex << offset << std::dec << '=' << label << '(' << *value << ')';
+    }
+    std::cerr << '\n';
+}
+
 std::optional<Rotator> lookAt(const Vector3& origin, const Vector3& target) {
     const double dx = target.x - origin.x;
     const double dy = target.y - origin.y;
@@ -231,6 +332,20 @@ std::optional<Rotator> lookAt(const Vector3& origin, const Vector3& target) {
 }
 
 std::optional<CameraView> readCamera(ProcessInstance<>& memory, const Unreal::ActorSnapshot& snapshot) {
+    static bool cameraDiagnosticPrinted = false;
+    std::uint64_t cameraManagerAddress = 0;
+    double cameraFov = resolveControllerFov(memory, snapshot.localController).value_or(std::numeric_limits<double>::quiet_NaN());
+    if (plausiblePointer(snapshot.localController)) {
+        const auto manager = read<std::uint64_t>(memory, snapshot.localController + Offsets::PlayerControllerCameraManager);
+        if (manager.has_value() && plausiblePointer(*manager)) {
+            cameraManagerAddress = *manager;
+            const auto fov = read<float>(memory, cameraManagerAddress + Offsets::PlayerCameraManagerCameraCache + Offsets::CameraCachePov + Offsets::MinimalViewFov);
+            if (fov.has_value() && std::isfinite(*fov) && *fov >= 20.0F && *fov <= 170.0F) cameraFov = *fov;
+            if (!cameraDiagnosticPrinted && std::getenv("WINSHIPPING_BOX_DEBUG") != nullptr) {
+                std::cerr << "box camera: controller=0x" << std::hex << snapshot.localController << " manager=0x" << cameraManagerAddress << " pov=0x" << (cameraManagerAddress + Offsets::PlayerCameraManagerCameraCache + Offsets::CameraCachePov) << std::dec << " fov=" << (fov.has_value() ? std::to_string(*fov) : std::string("unreadable")) << '\n';
+            }
+        }
+    }
     if (plausiblePointer(snapshot.cameraLocationPointer) && plausiblePointer(snapshot.cameraRotationPointer)) {
         double encodedA{};
         double encodedB{};
@@ -244,15 +359,37 @@ std::optional<CameraView> readCamera(ProcessInstance<>& memory, const Unreal::Ac
         addRead(reads, snapshot.cameraLocationPointer, location);
         if (runReads(memory, reads) && std::isfinite(encodedA) && std::isfinite(encodedB) && std::isfinite(encodedC) && std::abs(encodedC) <= 1.001 && std::isfinite(location.x) && std::isfinite(location.y) && std::isfinite(location.z)) {
             constexpr double radiansToDegrees = 57.295779513082320876;
-            return CameraView{location, Rotator{std::asin(std::clamp(encodedC, -1.0, 1.0)) * radiansToDegrees, std::atan2(-encodedA, encodedB) * radiansToDegrees, 0.0}};
+            const Rotator rotation{std::asin(std::clamp(encodedC, -1.0, 1.0)) * radiansToDegrees, std::atan2(-encodedA, encodedB) * radiansToDegrees, 0.0};
+            if (!std::isfinite(cameraFov)) cameraFov = resolveCameraFov(memory, cameraManagerAddress, location, rotation).value_or(cameraFov);
+            if (!cameraDiagnosticPrinted && std::getenv("WINSHIPPING_BOX_DEBUG") != nullptr) {
+                std::cerr << "box camera resolved: location=(" << location.x << ',' << location.y << ',' << location.z << ") rotation=(" << rotation.pitch << ',' << rotation.yaw << ") fov=" << cameraFov << '\n';
+                if (!std::isfinite(cameraFov)) {
+                    const auto worldFov = read<float>(memory, snapshot.world + Offsets::CameraFov);
+                    const auto controllerFov = read<float>(memory, snapshot.localController + Offsets::CameraFov);
+                    const auto locationFov = read<float>(memory, snapshot.cameraLocationPointer + Offsets::CameraFov);
+                    const auto rotationFov = read<float>(memory, snapshot.cameraRotationPointer + Offsets::CameraFov);
+                    std::cerr << "box supplied FOV +0x" << std::hex << Offsets::CameraFov << std::dec
+                              << " world=" << (worldFov.has_value() ? std::to_string(*worldFov) : "unreadable")
+                              << " controller=" << (controllerFov.has_value() ? std::to_string(*controllerFov) : "unreadable")
+                              << " location=" << (locationFov.has_value() ? std::to_string(*locationFov) : "unreadable")
+                              << " rotation=" << (rotationFov.has_value() ? std::to_string(*rotationFov) : "unreadable") << '\n';
+                    printFovCandidates(memory, "world", snapshot.world, 0x300);
+                    printFovCandidates(memory, "controller", snapshot.localController, 0x1000);
+                    printFovCandidates(memory, "manager", cameraManagerAddress, 0x3000);
+                    printCameraValueCandidates(memory, cameraManagerAddress, location, rotation);
+                    printFovCandidates(memory, "camera-location", snapshot.cameraLocationPointer, 0x400);
+                    printFovCandidates(memory, "camera-rotation", snapshot.cameraRotationPointer, 0x400);
+                }
+                cameraDiagnosticPrinted = true;
+            }
+            return CameraView{location, rotation, cameraFov};
         }
     }
 
-    if (!plausiblePointer(snapshot.localController)) return std::nullopt;
-    const auto cameraManager = read<std::uint64_t>(memory, snapshot.localController + Offsets::PlayerControllerCameraManager);
-    if (!cameraManager.has_value() || !plausiblePointer(*cameraManager)) return std::nullopt;
-    const std::uint64_t pov = *cameraManager + Offsets::PlayerCameraManagerCameraCache + Offsets::CameraCachePov;
+    if (!plausiblePointer(snapshot.localController) || !plausiblePointer(cameraManagerAddress)) return std::nullopt;
+    const std::uint64_t pov = cameraManagerAddress + Offsets::PlayerCameraManagerCameraCache + Offsets::CameraCachePov;
     CameraView view{};
+    view.fov = cameraFov;
     std::vector<ReadData> reads;
     reads.reserve(2);
     addRead(reads, pov + Offsets::MinimalViewLocation, view.location);
@@ -266,6 +403,31 @@ std::optional<CameraView> readCamera(ProcessInstance<>& memory, const Unreal::Ac
     if (!std::isfinite(view.location.x) || !std::isfinite(view.location.y) || !std::isfinite(view.location.z)) return std::nullopt;
     if (!std::isfinite(view.rotation.pitch) || !std::isfinite(view.rotation.yaw)) return std::nullopt;
     return view;
+}
+
+std::optional<std::pair<double, double>> worldToScreen(const Vector3& world, const CameraView& camera, std::uint16_t width, std::uint16_t height, double* cameraDepth = nullptr) {
+    if (!width || !height || !std::isfinite(camera.fov) || camera.fov < 20.0 || camera.fov > 170.0) return std::nullopt;
+    constexpr double degreesToRadians = 0.017453292519943295769;
+    const double pitch = camera.rotation.pitch * degreesToRadians;
+    const double yaw = camera.rotation.yaw * degreesToRadians;
+    const double sinPitch = std::sin(pitch);
+    const double cosPitch = std::cos(pitch);
+    const double sinYaw = std::sin(yaw);
+    const double cosYaw = std::cos(yaw);
+    const Vector3 delta{world.x - camera.location.x, world.y - camera.location.y, world.z - camera.location.z};
+    const Vector3 forward{cosPitch * cosYaw, cosPitch * sinYaw, sinPitch};
+    const Vector3 right{-sinYaw, cosYaw, 0.0};
+    const Vector3 up{-sinPitch * cosYaw, -sinPitch * sinYaw, cosPitch};
+    const double depth = delta.x * forward.x + delta.y * forward.y + delta.z * forward.z;
+    if (cameraDepth != nullptr) *cameraDepth = depth;
+    if (!std::isfinite(depth) || depth <= 1.0) return std::nullopt;
+    const double horizontal = delta.x * right.x + delta.y * right.y + delta.z * right.z;
+    const double vertical = delta.x * up.x + delta.y * up.y + delta.z * up.z;
+    const double focal = static_cast<double>(width) * 0.5 / std::tan(camera.fov * degreesToRadians * 0.5);
+    const double x = static_cast<double>(width) * 0.5 + horizontal * focal / depth;
+    const double y = static_cast<double>(height) * 0.5 - vertical * focal / depth;
+    if (!std::isfinite(x) || !std::isfinite(y)) return std::nullopt;
+    return std::pair<double, double>{x, y};
 }
 
 bool isVisible(const Unreal::ActorPosition& actor, double worldSeconds) {
@@ -343,6 +505,59 @@ Vector3 rotateVector(const Quaternion& rotation, const Vector3& vector) {
         vector.y + rotation.w * doubledCross.y + rotation.z * doubledCross.x - rotation.x * doubledCross.z,
         vector.z + rotation.w * doubledCross.z + rotation.x * doubledCross.y - rotation.y * doubledCross.x
     };
+}
+
+std::optional<Quaternion> normalizedQuaternion(const Quaternion& rotation) {
+    const double normSquared = rotation.x * rotation.x +
+        rotation.y * rotation.y + rotation.z * rotation.z +
+        rotation.w * rotation.w;
+    if (!std::isfinite(normSquared) || normSquared < 1.0e-12) return std::nullopt;
+    const double inverseNorm = 1.0 / std::sqrt(normSquared);
+    return Quaternion{
+        rotation.x * inverseNorm,
+        rotation.y * inverseNorm,
+        rotation.z * inverseNorm,
+        rotation.w * inverseNorm
+    };
+}
+
+std::optional<Vector3> meshLocalVector(const Transform& meshWorld,
+                                       const Vector3& worldVector) {
+    const auto rotation = normalizedQuaternion(meshWorld.rotation);
+    if (!rotation.has_value() ||
+        std::abs(meshWorld.scale.x) < 1.0e-6 ||
+        std::abs(meshWorld.scale.y) < 1.0e-6 ||
+        std::abs(meshWorld.scale.z) < 1.0e-6)
+        return std::nullopt;
+    const Quaternion inverse{
+        -rotation->x, -rotation->y, -rotation->z, rotation->w
+    };
+    const Vector3 localScaled = rotateVector(inverse, worldVector);
+    const Vector3 local{
+        localScaled.x / meshWorld.scale.x,
+        localScaled.y / meshWorld.scale.y,
+        localScaled.z / meshWorld.scale.z
+    };
+    if (!std::isfinite(local.x) || !std::isfinite(local.y) ||
+        !std::isfinite(local.z))
+        return std::nullopt;
+    return local;
+}
+
+std::optional<Vector3> meshWorldVector(const Transform& meshWorld,
+                                       const Vector3& localVector) {
+    const auto rotation = normalizedQuaternion(meshWorld.rotation);
+    if (!rotation.has_value()) return std::nullopt;
+    const Vector3 scaled{
+        localVector.x * meshWorld.scale.x,
+        localVector.y * meshWorld.scale.y,
+        localVector.z * meshWorld.scale.z
+    };
+    const Vector3 world = rotateVector(*rotation, scaled);
+    if (!std::isfinite(world.x) || !std::isfinite(world.y) ||
+        !std::isfinite(world.z))
+        return std::nullopt;
+    return world;
 }
 
 std::optional<Vector3> boneWorldPosition(ProcessInstance<>& memory, std::uint64_t boneArray, int index, const Transform& componentToWorld) {
@@ -473,38 +688,167 @@ std::optional<std::vector<std::uint64_t>> readPointerArray(ProcessInstance<>& me
     return pointers;
 }
 
+std::array<std::uint64_t, 4> protectedLowSlots(const ProtectedSlotStorage& storage) {
+    std::array<std::uint64_t, 4> slots{};
+    for (std::size_t index = 0; index < slots.size(); ++index) std::memcpy(&slots[index], storage.bytes.data() + (index * 0x20), sizeof(slots[index]));
+    return slots;
+}
+
 std::vector<LlamaAimTarget> llamaAimTargets(ProcessInstance<>& memory, const Unreal::ActorSnapshot& snapshot) {
     static std::uint64_t cachedWorld = 0;
     static std::vector<std::uint64_t> cachedActors;
     static std::chrono::steady_clock::time_point nextRefresh{};
     const auto now = std::chrono::steady_clock::now();
-    if (cachedWorld != snapshot.world || cachedActors.empty() || now >= nextRefresh) {
+    if (cachedWorld != snapshot.world) {
         cachedWorld = snapshot.world;
         cachedActors.clear();
-        nextRefresh = now + std::chrono::seconds(3);
-
-        const auto mapInfo = read<std::uint64_t>(memory, snapshot.gameState + Offsets::GameStateMapInfo);
-        if (mapInfo.has_value() && plausiblePointer(*mapInfo)) {
-            const auto llamaClass = read<std::uint64_t>(memory, *mapInfo + Offsets::MapInfoLlamaClass);
-            const auto levelsArray = read<RemoteArray>(memory, snapshot.world + Offsets::WorldLevels);
-            if (llamaClass.has_value() && plausiblePointer(*llamaClass) && levelsArray.has_value()) {
-                const auto levels = readPointerArray(memory, *levelsArray);
-                if (levels.has_value()) {
-                    for (const std::uint64_t level : *levels) {
-                        if (!plausiblePointer(level)) continue;
-                        const auto actorArray = read<RemoteArray>(memory, level + Offsets::LevelActors);
-                        if (!actorArray.has_value()) continue;
-                        const auto actors = readPointerArray(memory, *actorArray);
-                        if (!actors.has_value()) continue;
-                        for (const std::uint64_t actor : *actors) {
-                            if (!plausiblePointer(actor)) continue;
-                            const auto actorClass = read<std::uint64_t>(memory, actor + Offsets::ObjectClass);
-                            if (actorClass.has_value() && *actorClass == *llamaClass) cachedActors.push_back(actor);
-                        }
-                    }
+        nextRefresh = now;
+    }
+    if (cachedActors.empty() || now >= nextRefresh) {
+        std::vector<std::uint64_t> worldActors;
+        std::unordered_set<std::uint64_t> visitedActors;
+        const auto levelsArray = read<RemoteArray>(memory, snapshot.world + Offsets::WorldLevels);
+        const auto levels = levelsArray.has_value() ? readPointerArray(memory, *levelsArray) : std::nullopt;
+        if (levels.has_value()) {
+            for (const std::uint64_t level : *levels) {
+                if (!plausiblePointer(level)) continue;
+                const auto actorArray = read<RemoteArray>(memory, level + Offsets::LevelActors);
+                const auto actors = actorArray.has_value() ? readPointerArray(memory, *actorArray) : std::nullopt;
+                if (!actors.has_value()) continue;
+                for (const std::uint64_t actor : *actors) {
+                    if (plausiblePointer(actor) && visitedActors.insert(actor).second) worldActors.push_back(actor);
                 }
             }
         }
+
+        struct ActorSlots {
+            std::uint64_t actor{};
+            ProtectedSlotStorage storage{};
+        };
+        std::vector<ActorSlots> actorSlots(worldActors.size());
+        std::vector<ReadData> actorSlotReads;
+        actorSlotReads.reserve(actorSlots.size());
+        for (std::size_t index = 0; index < worldActors.size(); ++index) {
+            actorSlots[index].actor = worldActors[index];
+            addRead(actorSlotReads, worldActors[index] + Offsets::ObjectProtectedSlots, actorSlots[index].storage);
+        }
+        runReads(memory, actorSlotReads);
+
+        std::unordered_set<std::uint64_t> uniqueCandidates;
+        for (const ActorSlots& actor : actorSlots) {
+            for (const std::uint64_t candidate : protectedLowSlots(actor.storage)) {
+                if (plausiblePointer(candidate)) uniqueCandidates.insert(candidate);
+            }
+        }
+        struct CandidateSlots {
+            std::uint64_t object{};
+            ProtectedSlotStorage storage{};
+        };
+        std::vector<CandidateSlots> candidateSlots;
+        candidateSlots.reserve(uniqueCandidates.size());
+        for (const std::uint64_t candidate : uniqueCandidates) candidateSlots.push_back(CandidateSlots{candidate, {}});
+        std::vector<ReadData> candidateSlotReads;
+        candidateSlotReads.reserve(candidateSlots.size());
+        for (CandidateSlots& candidate : candidateSlots) addRead(candidateSlotReads, candidate.object + Offsets::ObjectProtectedSlots, candidate.storage);
+        runReads(memory, candidateSlotReads);
+
+        std::unordered_map<std::uint64_t, std::array<std::uint64_t, 4>> slotsByObject;
+        std::unordered_map<std::uint64_t, std::size_t> nestedPointerVotes;
+        slotsByObject.reserve(candidateSlots.size());
+        for (const CandidateSlots& candidate : candidateSlots) {
+            const auto slots = protectedLowSlots(candidate.storage);
+            slotsByObject.emplace(candidate.object, slots);
+            std::unordered_set<std::uint64_t> uniqueNestedPointers;
+            for (const std::uint64_t nested : slots) {
+                if (plausiblePointer(nested)) uniqueNestedPointers.insert(nested);
+            }
+            for (const std::uint64_t nested : uniqueNestedPointers) ++nestedPointerVotes[nested];
+        }
+        std::uint64_t metaClass = 0;
+        std::size_t metaClassVotes = 0;
+        for (const auto& [candidate, votes] : nestedPointerVotes) {
+            if (votes > metaClassVotes) {
+                metaClass = candidate;
+                metaClassVotes = votes;
+            }
+        }
+
+        std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> actorsByClass;
+        if (plausiblePointer(metaClass)) {
+            for (const ActorSlots& actor : actorSlots) {
+                for (const std::uint64_t candidate : protectedLowSlots(actor.storage)) {
+                    const auto candidateStorage = slotsByObject.find(candidate);
+                    if (candidateStorage == slotsByObject.end()) continue;
+                    if (std::find(candidateStorage->second.begin(), candidateStorage->second.end(), metaClass) == candidateStorage->second.end()) continue;
+                    actorsByClass[candidate].push_back(actor.actor);
+                    break;
+                }
+            }
+        }
+
+        struct PositionedCandidate {
+            std::uint64_t actor{};
+            std::uint64_t actorClass{};
+            std::uint64_t root{};
+            Vector3 position{};
+            float supplyDropSpawnOffset{};
+        };
+        std::vector<PositionedCandidate> positionedCandidates;
+        for (const auto& [actorClass, actors] : actorsByClass) {
+            if (actors.size() != Config::ExpectedLlamaCount) continue;
+            for (const std::uint64_t actor : actors) positionedCandidates.push_back(PositionedCandidate{actor, actorClass, 0, {}, 0.0F});
+        }
+        std::vector<ReadData> rootReads;
+        rootReads.reserve(positionedCandidates.size() * 2);
+        for (PositionedCandidate& candidate : positionedCandidates) {
+            addRead(rootReads, candidate.actor + Offsets::ActorRootComponent, candidate.root);
+            addRead(rootReads, candidate.actor + Offsets::AthenaSupplyDropSpawnOffsetZ, candidate.supplyDropSpawnOffset);
+        }
+        runReads(memory, rootReads);
+        std::vector<ReadData> positionReads;
+        positionReads.reserve(positionedCandidates.size());
+        for (PositionedCandidate& candidate : positionedCandidates) {
+            if (plausiblePointer(candidate.root)) addRead(positionReads, candidate.root + Offsets::SceneComponentRelativeLocation, candidate.position);
+        }
+        runReads(memory, positionReads);
+
+        std::unordered_map<std::uint64_t, std::vector<PositionedCandidate>> positionedByClass;
+        for (const PositionedCandidate& candidate : positionedCandidates) {
+            if (!std::isfinite(candidate.position.x) || !std::isfinite(candidate.position.y) || !std::isfinite(candidate.position.z)) continue;
+            positionedByClass[candidate.actorClass].push_back(candidate);
+        }
+        std::vector<std::uint64_t> matchingClasses;
+        for (const auto& [actorClass, actors] : positionedByClass) {
+            if (actors.size() != Config::ExpectedLlamaCount) continue;
+            double spreadSquared = 0.0;
+            bool validSupplyDropOffsets = true;
+            bool hasPositiveSupplyDropOffset = false;
+            for (const PositionedCandidate& actor : actors) {
+                const double spawnOffset = static_cast<double>(actor.supplyDropSpawnOffset);
+                if (!std::isfinite(spawnOffset) || std::abs(spawnOffset) > Config::LlamaMaximumSpawnOffset) {
+                    validSupplyDropOffsets = false;
+                    break;
+                }
+                if (spawnOffset >= Config::LlamaMinimumSpawnOffset) hasPositiveSupplyDropOffset = true;
+            }
+            if (!validSupplyDropOffsets || !hasPositiveSupplyDropOffset) continue;
+            for (std::size_t left = 0; left < actors.size(); ++left) {
+                for (std::size_t right = left + 1; right < actors.size(); ++right) {
+                    const double dx = actors[left].position.x - actors[right].position.x;
+                    const double dy = actors[left].position.y - actors[right].position.y;
+                    const double dz = actors[left].position.z - actors[right].position.z;
+                    spreadSquared = std::max(spreadSquared, (dx * dx) + (dy * dy) + (dz * dz));
+                }
+            }
+            if (spreadSquared >= Config::LlamaMinimumSpread * Config::LlamaMinimumSpread) matchingClasses.push_back(actorClass);
+        }
+        if (matchingClasses.size() == 1) {
+            const std::uint64_t llamaClass = matchingClasses.front();
+            std::vector<std::uint64_t> discoveredActors;
+            for (const PositionedCandidate& candidate : positionedByClass[llamaClass]) discoveredActors.push_back(candidate.actor);
+            if (discoveredActors.size() == Config::ExpectedLlamaCount) cachedActors = std::move(discoveredActors);
+        }
+        nextRefresh = now + (cachedActors.empty() ? Config::LlamaDiscoveryRetryInterval : Config::LlamaDiscoveryRefreshInterval);
     }
 
     std::vector<LlamaAimTarget> targets;
@@ -776,7 +1120,9 @@ std::optional<ActorSnapshot> actorPositions(ProcessInstance<>& memory, std::uint
             ++snapshot.invalidLocationCount;
             continue;
         }
-        snapshot.positions.push_back(ActorPosition{fields.pawn, fields.playerState, fields.mesh, fields.team, component.lastRenderTime, component.location.x, component.location.y, component.location.z});
+        snapshot.positions.push_back(ActorPosition{fields.pawn, fields.playerState,
+            fields.root, fields.mesh, fields.team, component.lastRenderTime,
+            component.location.x, component.location.y, component.location.z});
     }
 
     if (plausiblePointer(gameInstance)) {
@@ -1104,6 +1450,364 @@ std::optional<AimResult> aimAtNearestGroundItem(ProcessInstance<>& memory, const
     previousController = currentController;
     wasAiming = true;
     return AimResult{true, wrote, snapshot.localPawn, bestTarget->actor, localTeam, 0xFF, -3, bestTargetDistance / 100.0, std::sqrt(bestAngularDistanceSquared), cameraRotation.pitch, cameraRotation.yaw, bestDesired.pitch, bestDesired.yaw, rotationInput.pitch, rotationInput.yaw};
+}
+
+std::vector<PlayerBoxTarget> playerBoxTargets(ProcessInstance<>& memory,
+                                               const ActorSnapshot& snapshot,
+                                               const std::vector<PlayerBoxTarget>& previousTargets,
+                                               bool ignoreTeams) {
+    std::vector<PlayerBoxTarget> targets;
+    targets.reserve(std::max(snapshot.positions.size(), previousTargets.size()));
+    std::unordered_map<std::uint64_t, const PlayerBoxTarget*> previousByActor;
+    previousByActor.reserve(previousTargets.size());
+    for (const PlayerBoxTarget& previous : previousTargets)
+        previousByActor.emplace(previous.actor, &previous);
+    std::unordered_set<std::uint64_t> emittedActors;
+    std::unordered_set<std::uint64_t> blockedActors;
+    emittedActors.reserve(previousTargets.size() + snapshot.positions.size());
+    blockedActors.reserve(snapshot.positions.size());
+
+    const auto retainPrevious = [&](const PlayerBoxTarget& previous) {
+        if (previous.missedRebuilds >= Config::BoxTargetGraceRebuilds) return;
+        PlayerBoxTarget retained = previous;
+        ++retained.missedRebuilds;
+        targets.push_back(retained);
+        emittedActors.insert(retained.actor);
+    };
+
+    for (const ActorPosition& candidate : snapshot.positions) {
+        if (candidate.actor == snapshot.localPawn ||
+            (!ignoreTeams && snapshot.localTeam != 0xFF &&
+             candidate.team != 0xFF && candidate.team == snapshot.localTeam)) {
+            blockedActors.insert(candidate.actor);
+            continue;
+        }
+        const auto previousIterator = previousByActor.find(candidate.actor);
+        const PlayerBoxTarget* previous = previousIterator != previousByActor.end()
+            ? previousIterator->second : nullptr;
+        const bool matchingIdentity = previous != nullptr &&
+            previous->root == candidate.root && previous->mesh == candidate.mesh;
+        if (!plausiblePointer(candidate.root) || !plausiblePointer(candidate.mesh)) {
+            if (matchingIdentity) retainPrevious(*previous);
+            else blockedActors.insert(candidate.actor);
+            continue;
+        }
+        if (matchingIdentity) {
+            PlayerBoxTarget refreshed = *previous;
+            refreshed.visible = isVisible(candidate, snapshot.worldSeconds);
+            refreshed.missedRebuilds = 0;
+            targets.push_back(refreshed);
+            emittedActors.insert(candidate.actor);
+            continue;
+        }
+        const auto meshWorld = read<Transform>(
+            memory, candidate.mesh + Offsets::SkeletalMeshComponentToWorld);
+        if (!meshWorld.has_value() || !plausibleTransform(*meshWorld)) {
+            blockedActors.insert(candidate.actor);
+            continue;
+        }
+        const Vector3 worldMeshToRoot{
+            candidate.x - meshWorld->translation.x,
+            candidate.y - meshWorld->translation.y,
+            candidate.z - meshWorld->translation.z
+        };
+        const auto localMeshToRoot = meshLocalVector(*meshWorld, worldMeshToRoot);
+        if (!localMeshToRoot.has_value() ||
+            std::hypot(std::hypot(worldMeshToRoot.x, worldMeshToRoot.y),
+                       worldMeshToRoot.z) > 250.0) {
+            blockedActors.insert(candidate.actor);
+            continue;
+        }
+
+        targets.push_back(PlayerBoxTarget{
+            candidate.actor,
+            candidate.root,
+            candidate.mesh,
+            localMeshToRoot->x,
+            localMeshToRoot->y,
+            localMeshToRoot->z,
+            candidate.x,
+            candidate.y,
+            candidate.z,
+            isVisible(candidate, snapshot.worldSeconds),
+            0
+        });
+        emittedActors.insert(candidate.actor);
+    }
+
+    for (const PlayerBoxTarget& previous : previousTargets) {
+        if (emittedActors.find(previous.actor) != emittedActors.end() ||
+            blockedActors.find(previous.actor) != blockedActors.end())
+            continue;
+        retainPrevious(previous);
+    }
+    return targets;
+}
+
+bool refreshPlayerBoxTargets(ProcessInstance<>& memory,
+                             std::vector<PlayerBoxTarget>& targets,
+                             double worldSeconds) {
+    struct TargetUpdate {
+        Vector3 location{};
+        Transform meshWorld{};
+        float lastRenderTime{std::numeric_limits<float>::lowest()};
+    };
+    struct MotionSample {
+        Vector3 root{};
+        Vector3 mesh{};
+        bool initialized{};
+    };
+    static std::unordered_map<std::uint64_t, MotionSample> previousMotion;
+    static auto diagnosticStart = std::chrono::steady_clock::now();
+    static std::uint64_t diagnosticPolls = 0;
+    static std::uint64_t diagnosticRootChanges = 0;
+    static std::uint64_t diagnosticMeshChanges = 0;
+    const bool diagnoseMotion = std::getenv("WINSHIPPING_BOX_DEBUG_MOTION") != nullptr;
+    std::vector<TargetUpdate> updates(targets.size());
+    std::vector<ReadData> reads;
+    reads.reserve(targets.size() * 3);
+    for (std::size_t index = 0; index < targets.size(); ++index) {
+        if (plausiblePointer(targets[index].root))
+            addRead(reads, targets[index].root + Offsets::SceneComponentRelativeLocation,
+                    updates[index].location);
+        if (plausiblePointer(targets[index].mesh))
+            addRead(reads, targets[index].mesh + Offsets::SkeletalMeshComponentToWorld,
+                    updates[index].meshWorld);
+        if (plausiblePointer(targets[index].mesh))
+            addRead(reads, targets[index].mesh + Offsets::PrimitiveComponentLastRenderTime,
+                    updates[index].lastRenderTime);
+    }
+    const bool readsSucceeded = runReads(memory, reads);
+    if (!readsSucceeded) return false;
+    for (std::size_t index = 0; index < targets.size(); ++index) {
+        const TargetUpdate& update = updates[index];
+        const bool validRoot = std::isfinite(update.location.x) &&
+            std::isfinite(update.location.y) && std::isfinite(update.location.z);
+        const bool validMesh = plausibleTransform(update.meshWorld);
+        if (diagnoseMotion && (validRoot || validMesh)) {
+            MotionSample& previous = previousMotion[targets[index].actor];
+            if (previous.initialized) {
+                if (validRoot && std::hypot(
+                        std::hypot(update.location.x - previous.root.x,
+                                   update.location.y - previous.root.y),
+                        update.location.z - previous.root.z) > 0.001)
+                    ++diagnosticRootChanges;
+                if (validMesh && std::hypot(
+                        std::hypot(update.meshWorld.translation.x - previous.mesh.x,
+                                   update.meshWorld.translation.y - previous.mesh.y),
+                        update.meshWorld.translation.z - previous.mesh.z) > 0.001)
+                    ++diagnosticMeshChanges;
+            }
+            if (validRoot) previous.root = update.location;
+            if (validMesh) previous.mesh = update.meshWorld.translation;
+            previous.initialized = true;
+        }
+        if (validMesh) {
+            const Vector3 localMeshToRoot{
+                targets[index].meshLocalToRootX,
+                targets[index].meshLocalToRootY,
+                targets[index].meshLocalToRootZ
+            };
+            const auto worldMeshToRoot = meshWorldVector(
+                update.meshWorld, localMeshToRoot);
+            if (worldMeshToRoot.has_value()) {
+                targets[index].rootX = update.meshWorld.translation.x + worldMeshToRoot->x;
+                targets[index].rootY = update.meshWorld.translation.y + worldMeshToRoot->y;
+                targets[index].rootZ = update.meshWorld.translation.z + worldMeshToRoot->z;
+            } else if (validRoot) {
+                targets[index].rootX = update.location.x;
+                targets[index].rootY = update.location.y;
+                targets[index].rootZ = update.location.z;
+            }
+        } else if (validRoot) {
+            targets[index].rootX = update.location.x;
+            targets[index].rootY = update.location.y;
+            targets[index].rootZ = update.location.z;
+        }
+        targets[index].visible = std::isfinite(update.lastRenderTime) &&
+            std::isfinite(worldSeconds) &&
+            worldSeconds - static_cast<double>(update.lastRenderTime) <= 0.06;
+    }
+    if (diagnoseMotion) {
+        ++diagnosticPolls;
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(
+            now - diagnosticStart).count();
+        if (seconds >= 1.0) {
+            std::cerr << "box motion samples: seconds=" << seconds
+                      << " polls=" << diagnosticPolls
+                      << " root_changes=" << diagnosticRootChanges
+                      << " mesh_changes=" << diagnosticMeshChanges << '\n';
+            diagnosticStart = now;
+            diagnosticPolls = 0;
+            diagnosticRootChanges = 0;
+            diagnosticMeshChanges = 0;
+        }
+    }
+    return readsSucceeded;
+}
+
+std::string_view boxProjectionFailureName(BoxProjectionFailure failure) {
+    switch (failure) {
+        case BoxProjectionFailure::None: return "none";
+        case BoxProjectionFailure::CameraUnavailable: return "camera-unavailable";
+        case BoxProjectionFailure::BehindCamera: return "behind-camera";
+        case BoxProjectionFailure::InvalidProjection: return "invalid-projection";
+        case BoxProjectionFailure::InvalidExtent: return "invalid-extent";
+        case BoxProjectionFailure::Offscreen: return "offscreen";
+    }
+    return "unknown";
+}
+
+std::vector<PlayerBox> projectPlayerBoxes(ProcessInstance<>& memory, const ActorSnapshot& snapshot, const std::vector<PlayerBoxTarget>& targets, std::uint16_t screenWidth, std::uint16_t screenHeight, BoxProjectionDebug* debug) {
+    struct SmoothedExtent {
+        double halfWidth;
+        double halfHeight;
+        std::chrono::steady_clock::time_point updated;
+    };
+    static std::unordered_map<std::uint64_t, SmoothedExtent> smoothedExtents;
+    constexpr double capsuleHalfHeight = 90.0;
+    constexpr double capsuleRadius = 42.0;
+    constexpr double smoothingTimeSeconds = 0.020;
+
+    std::vector<PlayerBox> boxes;
+    const auto camera = readCamera(memory, snapshot);
+    if (debug != nullptr) {
+        debug->cameraValid = camera.has_value() && std::isfinite(camera->fov);
+        debug->targetCount = targets.size();
+        debug->projectedCount = 0;
+        debug->players.clear();
+        debug->players.reserve(targets.size());
+        if (camera.has_value()) {
+            debug->cameraX = camera->location.x;
+            debug->cameraY = camera->location.y;
+            debug->cameraZ = camera->location.z;
+            debug->cameraPitch = camera->rotation.pitch;
+            debug->cameraYaw = camera->rotation.yaw;
+            debug->cameraFov = camera->fov;
+        }
+    }
+    if (!camera.has_value() || !std::isfinite(camera->fov)) {
+        if (debug != nullptr) {
+            for (const PlayerBoxTarget& candidate : targets) {
+                debug->players.push_back(PlayerBoxDebug{
+                    candidate.actor, candidate.root, candidate.mesh,
+                    candidate.rootX, candidate.rootY, candidate.rootZ, 0.0,
+                    candidate.visible, false,
+                    BoxProjectionFailure::CameraUnavailable, {}});
+            }
+        }
+        return boxes;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::unordered_set<std::uint64_t> seenActors;
+    boxes.reserve(targets.size());
+    seenActors.reserve(targets.size());
+    for (const PlayerBoxTarget& candidate : targets) {
+        PlayerBoxDebug playerDebug{
+            candidate.actor, candidate.root, candidate.mesh,
+            candidate.rootX, candidate.rootY, candidate.rootZ,
+            std::numeric_limits<double>::infinity(), candidate.visible,
+            false, BoxProjectionFailure::None, {}};
+        double rawLeft = std::numeric_limits<double>::infinity();
+        double rawTop = std::numeric_limits<double>::infinity();
+        double rawRight = -std::numeric_limits<double>::infinity();
+        double rawBottom = -std::numeric_limits<double>::infinity();
+        bool projected = true;
+        bool behindCamera = false;
+        for (const double zOffset : {-capsuleHalfHeight, capsuleHalfHeight}) {
+            for (const double xOffset : {-capsuleRadius, capsuleRadius}) {
+                for (const double yOffset : {-capsuleRadius, capsuleRadius}) {
+                    double depth = std::numeric_limits<double>::quiet_NaN();
+                    const auto point = worldToScreen(
+                        Vector3{candidate.rootX + xOffset,
+                                candidate.rootY + yOffset,
+                                candidate.rootZ + zOffset},
+                        *camera, screenWidth, screenHeight, &depth);
+                    if (std::isfinite(depth))
+                        playerDebug.minimumDepth = std::min(playerDebug.minimumDepth, depth);
+                    if (!point.has_value()) {
+                        if (std::isfinite(depth) && depth <= 1.0) behindCamera = true;
+                        projected = false;
+                        break;
+                    }
+                    rawLeft = std::min(rawLeft, point->first);
+                    rawTop = std::min(rawTop, point->second);
+                    rawRight = std::max(rawRight, point->first);
+                    rawBottom = std::max(rawBottom, point->second);
+                }
+                if (!projected) break;
+            }
+            if (!projected) break;
+        }
+        if (!projected) {
+            playerDebug.failure = behindCamera
+                ? BoxProjectionFailure::BehindCamera
+                : BoxProjectionFailure::InvalidProjection;
+            if (debug != nullptr) debug->players.push_back(playerDebug);
+            continue;
+        }
+
+        const double centerX = (rawLeft + rawRight) * 0.5;
+        const double centerY = (rawTop + rawBottom) * 0.5;
+        const double rawHalfWidth = (rawRight - rawLeft) * 0.5;
+        const double rawHalfHeight = (rawBottom - rawTop) * 0.5;
+        if (!std::isfinite(rawHalfWidth) || !std::isfinite(rawHalfHeight) ||
+            rawHalfWidth < 2.0 || rawHalfHeight < 4.0 ||
+            rawHalfHeight > static_cast<double>(screenHeight)) {
+            playerDebug.failure = BoxProjectionFailure::InvalidExtent;
+            if (debug != nullptr) debug->players.push_back(playerDebug);
+            continue;
+        }
+
+        seenActors.insert(candidate.actor);
+        auto [extentIterator, inserted] = smoothedExtents.try_emplace(
+            candidate.actor, SmoothedExtent{rawHalfWidth, rawHalfHeight, now});
+        SmoothedExtent& extent = extentIterator->second;
+        if (!inserted) {
+            const double elapsed = std::chrono::duration<double>(now - extent.updated).count();
+            const double alpha = std::clamp(
+                1.0 - std::exp(-elapsed / smoothingTimeSeconds), 0.05, 1.0);
+            extent.halfWidth += (rawHalfWidth - extent.halfWidth) * alpha;
+            extent.halfHeight += (rawHalfHeight - extent.halfHeight) * alpha;
+            extent.updated = now;
+        }
+        const double left = centerX - extent.halfWidth;
+        const double top = centerY - extent.halfHeight;
+        const double right = centerX + extent.halfWidth;
+        const double bottom = centerY + extent.halfHeight;
+        if (right <= 0.0 || bottom <= 0.0 || left >= screenWidth || top >= screenHeight) {
+            playerDebug.failure = BoxProjectionFailure::Offscreen;
+            if (debug != nullptr) debug->players.push_back(playerDebug);
+            continue;
+        }
+        const double clippedLeft = std::clamp(left, 0.0, static_cast<double>(screenWidth - 1));
+        const double clippedTop = std::clamp(top, 0.0, static_cast<double>(screenHeight - 1));
+        const double clippedRight = std::clamp(right, clippedLeft + 1.0, static_cast<double>(screenWidth));
+        const double clippedBottom = std::clamp(bottom, clippedTop + 1.0, static_cast<double>(screenHeight));
+        const PlayerBox box{
+            candidate.actor,
+            static_cast<std::uint16_t>(std::lround(clippedLeft)),
+            static_cast<std::uint16_t>(std::lround(clippedTop)),
+            static_cast<std::uint16_t>(std::max(1.0, std::round(clippedRight - clippedLeft))),
+            static_cast<std::uint16_t>(std::max(1.0, std::round(clippedBottom - clippedTop))),
+            candidate.visible
+        };
+        boxes.push_back(box);
+        if (debug != nullptr) {
+            playerDebug.projected = true;
+            playerDebug.box = box;
+            debug->players.push_back(playerDebug);
+            ++debug->projectedCount;
+        }
+    }
+    for (auto iterator = smoothedExtents.begin(); iterator != smoothedExtents.end();) {
+        if (seenActors.find(iterator->first) == seenActors.end())
+            iterator = smoothedExtents.erase(iterator);
+        else
+            ++iterator;
+    }
+    return boxes;
 }
 
 HighlightResult updatePlayerHighlights(ProcessInstance<>& memory, const ActorSnapshot& snapshot, bool enabled, bool ignoreTeams) {

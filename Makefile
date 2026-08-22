@@ -1,7 +1,7 @@
 CXX ?= g++
-CXXFLAGS ?= -Ofast -march=native
+CXXFLAGS ?= -O3 -march=native
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -Werror -Wno-deprecated-declarations -Wno-reorder -Wno-unused-parameter
-CPPFLAGS += -Isrc -isystem build/deps/memflow/memflow-ffi
+CPPFLAGS += -Isrc -I/home/andrew/programs/vm/vgk/tools/tu104-bar1-overlay -isystem build/deps/memflow/memflow-ffi
 LDLIBS += -lm -ldl -lpthread
 
 BUILD_DIR := build

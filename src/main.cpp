@@ -1,4 +1,5 @@
 #include "Config.hpp"
+#include "BoxOverlay.hpp"
 #include "Dtb.hpp"
 #include "Unreal.hpp"
 
@@ -8,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cerrno>
 #include <csignal>
 #include <cmath>
 #include <cstdlib>
@@ -120,9 +122,22 @@ struct Arguments {
     bool ignoreTeams{};
     bool printActors{};
     bool chams{};
+    bool boxes{};
+    bool debug{};
+    std::uint32_t boxRepaintHz{Config::DefaultBoxRepaintHz};
     std::optional<Unreal::ItemRarity> rarity;
     std::string itemName;
 };
+
+std::optional<std::uint32_t> parseBoxRepaintHz(std::string_view value) {
+    const std::string text(value);
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(text.c_str(), &end, 10);
+    if (errno != 0 || end == text.c_str() || *end != '\0' ||
+        parsed == 0 || parsed > 100000) return std::nullopt;
+    return static_cast<std::uint32_t>(parsed);
+}
 
 std::optional<Unreal::WeaponCategory> parseWeaponCategory(std::string_view value) {
     std::string normalized;
@@ -204,18 +219,21 @@ std::optional<Unreal::ItemRarity> parseItemRarity(std::string_view value) {
 }
 
 void printUsage(std::ostream& output, const char* executable) {
-    output << "usage: " << executable << " [--smoothing FLOAT] [--vehicle-smoothing FLOAT] [--weapon-smoothing TYPE=FLOAT] [--item-name \"NAME\" [--rarity RARITY]] [--chams] [--clear-aim] [--read-only] [--bone-probe] [--ignore-isabot] [--ignore-teams] [--print-actors]\n";
+    output << "usage: " << executable << " [--smoothing FLOAT] [--vehicle-smoothing FLOAT] [--weapon-smoothing TYPE=FLOAT] [--item-name \"NAME\" [--rarity RARITY]] [--chams|--boxes] [--hz HZ] [--debug] [--clear-aim] [--read-only] [--bone-probe] [--ignore-isabot] [--ignore-teams] [--print-actors]\n";
     output << "  --smoothing FLOAT  divide pitch/yaw correction by FLOAT each iteration (default " << Config::DefaultSmoothing << ")\n";
     output << "  --vehicle-smoothing FLOAT  use FLOAT instead while the local pawn is on a vehicle\n";
     output << "  --weapon-smoothing TYPE=FLOAT  repeatable held-weapon override; TYPE is pistol, shotgun, rifle, smg, sniper, launcher, bow, minigun, melee, utility, unarmed, or unknown\n";
     output << "  --item-name NAME   find ground pickups containing NAME and aim at the nearest while Y is held\n";
     output << "  --rarity RARITY    restrict item-name matches to RARITY or higher (Common through Unattainable)\n";
     output << "  --chams            apply the engine highlight to aim-eligible player pawns\n";
+    output << "  --boxes            draw host-side boxes; green when visible, red when occluded\n";
+    output << "  --hz HZ            BAR1 repaint rate for --boxes (default " << Config::DefaultBoxRepaintHz << ", range 1-100000)\n";
+    output << "  --debug            print one-second box, camera, player, and delivery diagnostics\n";
     output << "  --clear-aim        clear pending controller rotation input and exit\n";
     output << "  --read-only        disable targeting and memory writes while still reporting right-click\n";
     output << "  --bone-probe       resolve sample bones once and exit without writing memory\n";
-    output << "  --ignore-isabot    include AI-controlled player states in output, aim, and chams\n";
-    output << "  --ignore-teams     allow aim and chams to affect pawns on the local team\n";
+    output << "  --ignore-isabot    include AI-controlled player states in output, aim, chams, and boxes\n";
+    output << "  --ignore-teams     allow aim, chams, and boxes to affect pawns on the local team\n";
     output << "  --print-actors     print every resolved pawn instead of the closest five\n";
 }
 
@@ -253,6 +271,24 @@ std::optional<Arguments> parseArguments(int argc, char** argv) {
         }
         if (argument == "--chams") {
             arguments.chams = true;
+            continue;
+        }
+        if (argument == "--boxes") {
+            arguments.boxes = true;
+            continue;
+        }
+        if (argument == "--debug") {
+            arguments.debug = true;
+            continue;
+        }
+        if ((argument == "--hz" || argument == "--box-hz") && index + 1 < argc) {
+            const std::string value = argv[++index];
+            const auto parsed = parseBoxRepaintHz(value);
+            if (!parsed.has_value()) {
+                std::cerr << argument << " must be an integer from 1 through 100000\n";
+                return std::nullopt;
+            }
+            arguments.boxRepaintHz = *parsed;
             continue;
         }
         if (argument == "--item-name" && index + 1 < argc) {
@@ -317,6 +353,18 @@ std::optional<Arguments> parseArguments(int argc, char** argv) {
     }
     if (arguments.rarity.has_value() && arguments.itemName.empty()) {
         std::cerr << "--rarity requires --item-name\n";
+        return std::nullopt;
+    }
+    if (arguments.chams && arguments.boxes) {
+        std::cerr << "--chams and --boxes are alternatives and cannot be combined\n";
+        return std::nullopt;
+    }
+    if (arguments.readOnly && arguments.boxes) {
+        std::cerr << "--boxes writes scanout VRAM and cannot be combined with --read-only\n";
+        return std::nullopt;
+    }
+    if (arguments.debug && !arguments.boxes) {
+        std::cerr << "--debug requires --boxes\n";
         return std::nullopt;
     }
     return arguments;
@@ -443,7 +491,7 @@ std::optional<std::uint64_t> configureDtb(OsInstance<>& os, const ProcessInfo& p
     return std::nullopt;
 }
 
-std::string renderFrame(const Unreal::ActorSnapshot& snapshot, const std::optional<Unreal::AimResult>& aim, const std::optional<Unreal::HighlightResult>& highlights, const std::optional<Unreal::GroundItemSnapshot>& groundItems, std::uint64_t imageBase, const Arguments& arguments, const std::optional<std::uint64_t>& currentVehicle, const std::optional<Unreal::WeaponSnapshot>& currentWeapon, double pawnSmoothing, bool rightButtonDown, bool llamaButtonDown, bool itemButtonDown) {
+std::string renderFrame(const Unreal::ActorSnapshot& snapshot, const std::optional<Unreal::AimResult>& aim, const std::optional<Unreal::HighlightResult>& highlights, const std::optional<Unreal::GroundItemSnapshot>& groundItems, std::uint64_t imageBase, const Arguments& arguments, const std::optional<std::uint64_t>& currentVehicle, const std::optional<Unreal::WeaponSnapshot>& currentWeapon, const std::optional<std::size_t>& boxCount, double pawnSmoothing, bool rightButtonDown, bool llamaButtonDown, bool itemButtonDown) {
     std::ostringstream frame;
     frame << Config::TargetProcessName << " | base=0x" << std::hex << imageBase << " world=0x" << snapshot.world << " game_state=0x" << snapshot.gameState << std::dec;
     frame << " | players=" << snapshot.reportedCount << " positioned=" << snapshot.positions.size() << " raw=" << snapshot.rawCount << " bots_filtered=" << snapshot.filteredBotCount << '\n';
@@ -453,6 +501,12 @@ std::string renderFrame(const Unreal::ActorSnapshot& snapshot, const std::option
     else if (arguments.readOnly) frame << "disabled (read-only)";
     else if (!highlights.has_value()) frame << "context unavailable";
     else frame << "active=" << highlights->active << " eligible=" << highlights->eligible << " applied=" << highlights->applied << " restored=" << highlights->restored << " failed=" << highlights->failed;
+    frame << '\n';
+    frame << "boxes=";
+    if (!arguments.boxes) frame << "disabled";
+    else if (!boxCount.has_value()) frame << "renderer unavailable";
+    else frame << "active=" << *boxCount << " green=visible red=occluded repaint="
+               << arguments.boxRepaintHz << "Hz";
     frame << '\n';
     frame << "ground-item=";
     if (arguments.itemName.empty()) frame << "disabled";
@@ -518,6 +572,95 @@ std::string renderFrame(const Unreal::ActorSnapshot& snapshot, const std::option
     return frame.str();
 }
 
+struct BoxDebugCounters {
+    std::uint64_t actorRefreshes{};
+    std::uint64_t actorRefreshFailures{};
+    std::uint64_t targetRebuilds{};
+    std::uint64_t anchorRefreshes{};
+    std::uint64_t anchorRefreshFailures{};
+    std::uint64_t projectionFrames{};
+    std::uint64_t cameraFailures{};
+    std::uint64_t emptyFramesWithTargets{};
+    std::uint64_t previousSubmitted{};
+    std::uint64_t previousDropped{};
+};
+
+void printBoxDebug(const Unreal::ActorSnapshot& snapshot,
+                   const Unreal::BoxProjectionDebug& projection,
+                   BoxDebugCounters& counters,
+                   const BoxOverlay& overlay) {
+    const std::uint64_t submitted = overlay.submittedFrames();
+    const std::uint64_t dropped = overlay.droppedFrames();
+    std::cout << "\n[box-debug] actor_refresh=" << counters.actorRefreshes
+              << " actor_fail=" << counters.actorRefreshFailures
+              << " target_rebuild=" << counters.targetRebuilds
+              << " anchor_refresh=" << counters.anchorRefreshes
+              << " anchor_fail=" << counters.anchorRefreshFailures
+              << " projection_frames=" << counters.projectionFrames
+              << " camera_fail=" << counters.cameraFailures
+              << " empty_with_targets=" << counters.emptyFramesWithTargets
+              << " submitted=" << (submitted - counters.previousSubmitted)
+              << " pipe_dropped=" << (dropped - counters.previousDropped) << '\n';
+    std::cout << "[box-debug] snapshot raw=" << snapshot.rawCount
+              << " reported=" << snapshot.reportedCount
+              << " positioned=" << snapshot.positions.size()
+              << " targets=" << projection.targetCount
+              << " projected=" << projection.projectedCount
+              << " world_seconds=" << std::fixed << std::setprecision(6)
+              << snapshot.worldSeconds << '\n';
+    std::cout << "[box-debug] camera=" << (projection.cameraValid ? "valid" : "INVALID")
+              << " location=(" << std::setprecision(3)
+              << projection.cameraX << ',' << projection.cameraY << ','
+              << projection.cameraZ << ") rotation=("
+              << projection.cameraPitch << ',' << projection.cameraYaw
+              << ") fov=" << projection.cameraFov << '\n';
+
+    for (const Unreal::PlayerBoxDebug& player : projection.players) {
+        const auto position = std::find_if(
+            snapshot.positions.begin(), snapshot.positions.end(),
+            [&player](const Unreal::ActorPosition& candidate) {
+                return candidate.actor == player.actor;
+            });
+        std::cout << "[box-player] actor=0x" << std::hex << player.actor
+                  << " root=0x" << player.root << " mesh=0x" << player.mesh
+                  << std::dec;
+        if (position != snapshot.positions.end()) {
+            const double renderAge = snapshot.worldSeconds -
+                static_cast<double>(position->lastRenderTime);
+            std::cout << " team=" << static_cast<unsigned int>(position->team)
+                      << " raw=(" << std::fixed << std::setprecision(3)
+                      << position->x << ',' << position->y << ',' << position->z
+                      << ") render_age=" << std::setprecision(6) << renderAge;
+        } else {
+            std::cout << " raw=missing";
+        }
+        std::cout << " anchor=(" << std::fixed << std::setprecision(3)
+                  << player.rootX << ',' << player.rootY << ',' << player.rootZ
+                  << ") min_depth=" << player.minimumDepth
+                  << " visible=" << (player.visible ? "yes" : "no");
+        if (player.projected) {
+            std::cout << " box=(" << player.box.x << ',' << player.box.y << ','
+                      << player.box.width << ',' << player.box.height << ')';
+        } else {
+            std::cout << " rejected="
+                      << Unreal::boxProjectionFailureName(player.failure);
+        }
+        std::cout << '\n';
+    }
+    std::cout << std::flush;
+
+    counters.actorRefreshes = 0;
+    counters.actorRefreshFailures = 0;
+    counters.targetRebuilds = 0;
+    counters.anchorRefreshes = 0;
+    counters.anchorRefreshFailures = 0;
+    counters.projectionFrames = 0;
+    counters.cameraFailures = 0;
+    counters.emptyFramesWithTargets = 0;
+    counters.previousSubmitted = submitted;
+    counters.previousDropped = dropped;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -562,12 +705,22 @@ int main(int argc, char** argv) {
     mf_inventory_free(inventory);
 
     std::optional<ProcessInfo> exactProcessInfo;
-    os.process_info_list_callback([&exactProcessInfo](ProcessInfo info) {
-        if (std::string_view(info.name) == Config::TargetProcessName) exactProcessInfo = info;
+    std::vector<ProcessInfo> protectedNameMatches;
+    const std::string_view targetName = Config::TargetProcessName;
+    const std::size_t suffix = targetName.find("-Win64");
+    const std::string_view protectedName = suffix == std::string_view::npos ? targetName : targetName.substr(0, suffix);
+    os.process_info_list_callback([&](ProcessInfo info) {
+        const std::string_view name(info.name);
+        if (name == targetName) exactProcessInfo = info;
+        else if (name == protectedName) protectedNameMatches.push_back(info);
         return true;
     });
+    if (!exactProcessInfo.has_value() && protectedNameMatches.size() == 1) {
+        exactProcessInfo = protectedNameMatches.front();
+        std::cerr << "using unique protected EPROCESS name " << protectedName << " for " << targetName << '\n';
+    }
     if (!exactProcessInfo.has_value()) {
-        std::cerr << "Windows process " << Config::TargetProcessName << " was not found\n";
+        std::cerr << "Windows process " << Config::TargetProcessName << " was not found unambiguously (protected-name matches=" << protectedNameMatches.size() << ")\n";
         return 1;
     }
     const ProcessInfo processInfo = *exactProcessInfo;
@@ -643,12 +796,22 @@ int main(int argc, char** argv) {
     constexpr int RightMouseButton = 0x02;
     constexpr int LlamaAimKey = 0x55;
     constexpr int GroundItemAimKey = 0x59;
+    BoxOverlay boxOverlay;
+    std::optional<std::size_t> boxCount;
+    std::signal(SIGPIPE, SIG_IGN);
+    if (arguments->boxes && !boxOverlay.start(arguments->boxRepaintHz)) {
+        std::cerr << "could not start the host BAR1 box renderer\n";
+        return 1;
+    }
     std::cout << "\x1B[2J\x1B[H";
     std::signal(SIGINT, requestStop);
     std::signal(SIGTERM, requestStop);
     const auto start = std::chrono::steady_clock::now();
     auto nextDisplay = start;
     auto nextActorRefresh = start;
+    auto nextBoxAnchorRefresh = start;
+    auto nextBoxRefresh = start;
+    auto nextBoxDebug = start + std::chrono::seconds(1);
     auto nextHighlightRefresh = start;
     auto nextVehicleStateRefresh = start;
     auto nextWeaponStateRefresh = start;
@@ -667,6 +830,9 @@ int main(int argc, char** argv) {
     std::optional<Unreal::GroundItemSnapshot> groundItems;
     std::optional<std::uint64_t> currentVehicle;
     std::optional<Unreal::WeaponSnapshot> currentWeapon;
+    std::vector<Unreal::PlayerBoxTarget> boxTargets;
+    Unreal::BoxProjectionDebug boxProjectionDebug;
+    BoxDebugCounters boxDebugCounters;
     const bool weaponSmoothingConfigured = hasWeaponSmoothing(*arguments);
     while (!stopRequested) {
         KeyboardStateBase<> keyboardState;
@@ -678,6 +844,7 @@ int main(int argc, char** argv) {
         double pawnSmoothing = effectivePawnSmoothing(*arguments, currentVehicle, currentWeapon);
         bool actorRefreshed = false;
         if (!snapshot.has_value() || now >= nextActorRefresh) {
+            if (arguments->debug) ++boxDebugCounters.actorRefreshes;
             const auto refreshed = Unreal::actorPositions(process, imageBase, arguments->ignoreIsABot);
             if (refreshed.has_value()) {
                 if (snapshot.has_value() && lastWorld != 0 && refreshed->world != lastWorld) {
@@ -696,7 +863,9 @@ int main(int argc, char** argv) {
                 lastWorld = snapshot->world;
                 lastActorRefresh = now;
                 actorRefreshed = true;
-            } else if (snapshot.has_value() && now - lastActorRefresh >= Config::ActorSnapshotExpiry) {
+            } else {
+                if (arguments->debug) ++boxDebugCounters.actorRefreshFailures;
+                if (snapshot.has_value() && now - lastActorRefresh >= Config::ActorSnapshotExpiry) {
                 if (specialAimMode == SpecialAimMode::Pawn) Unreal::aimAtNearestPawn(process, *snapshot, pawnSmoothing, false, arguments->ignoreTeams);
                 else if (specialAimMode == SpecialAimMode::Llama) Unreal::aimAtNearestLlama(process, *snapshot, false);
                 else if (specialAimMode == SpecialAimMode::GroundItem) Unreal::aimAtNearestGroundItem(process, *snapshot, groundItems.value_or(Unreal::GroundItemSnapshot{}), false);
@@ -707,8 +876,47 @@ int main(int argc, char** argv) {
                 nextVehicleStateRefresh = now;
                 nextWeaponStateRefresh = now;
                 specialAimMode = SpecialAimMode::None;
+                }
             }
             nextActorRefresh = now + Config::ActorRefreshInterval;
+        }
+
+        if (arguments->boxes && actorRefreshed && snapshot.has_value()) {
+            boxTargets = Unreal::playerBoxTargets(
+                process, *snapshot, boxTargets, arguments->ignoreTeams);
+            if (arguments->debug) ++boxDebugCounters.targetRebuilds;
+            nextBoxAnchorRefresh = now + Config::BoxAnchorRefreshInterval;
+        } else if (arguments->boxes && snapshot.has_value() &&
+                   now >= nextBoxAnchorRefresh) {
+            const bool refreshed = Unreal::refreshPlayerBoxTargets(
+                process, boxTargets, snapshot->worldSeconds);
+            if (arguments->debug) {
+                ++boxDebugCounters.anchorRefreshes;
+                if (!refreshed) ++boxDebugCounters.anchorRefreshFailures;
+            }
+            nextBoxAnchorRefresh = now + Config::BoxAnchorRefreshInterval;
+        }
+        if (arguments->boxes && snapshot.has_value() && now >= nextBoxRefresh) {
+            const auto boxes = Unreal::projectPlayerBoxes(
+                process, *snapshot, boxTargets, Config::BoxScreenWidth,
+                Config::BoxScreenHeight,
+                arguments->debug ? &boxProjectionDebug : nullptr);
+            if (arguments->debug) {
+                ++boxDebugCounters.projectionFrames;
+                if (!boxProjectionDebug.cameraValid)
+                    ++boxDebugCounters.cameraFailures;
+                if (!boxTargets.empty() && boxes.empty())
+                    ++boxDebugCounters.emptyFramesWithTargets;
+            }
+            if (!boxOverlay.submit(boxes)) {
+                std::cerr << "\nBAR1 box renderer stopped unexpectedly\n";
+                stopRequested = 1;
+            } else boxCount = boxes.size();
+            nextBoxRefresh = now + Config::BoxRefreshInterval;
+        } else if (arguments->boxes && !snapshot.has_value() && boxCount.value_or(0) != 0) {
+            boxTargets.clear();
+            if (boxOverlay.submit({})) boxCount = 0;
+            else stopRequested = 1;
         }
 
         if (snapshot.has_value()) {
@@ -747,20 +955,30 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (now >= nextDisplay && snapshot.has_value()) {
-            std::cout << "\r\x1B[H" << renderFrame(*snapshot, aim, highlights, groundItems, imageBase, *arguments, currentVehicle, currentWeapon, pawnSmoothing, rightButtonDown, llamaButtonDown, itemButtonDown) << "\x1B[J" << std::flush;
+        if (arguments->debug && snapshot.has_value() && now >= nextBoxDebug) {
+            printBoxDebug(*snapshot, boxProjectionDebug, boxDebugCounters,
+                          boxOverlay);
+            nextBoxDebug = now + std::chrono::seconds(1);
+        }
+
+        if (!arguments->debug && now >= nextDisplay && snapshot.has_value()) {
+            std::cout << "\r\x1B[H" << renderFrame(*snapshot, aim, highlights, groundItems, imageBase, *arguments, currentVehicle, currentWeapon, boxCount, pawnSmoothing, rightButtonDown, llamaButtonDown, itemButtonDown) << "\x1B[J" << std::flush;
             nextDisplay = now + Config::DisplayInterval;
-        } else if (now >= nextDisplay) {
+        } else if (!arguments->debug && now >= nextDisplay) {
             std::cout << "\r\x1B[H" << Config::TargetProcessName << " | actor snapshot unavailable\n\x1B[J" << std::flush;
             nextDisplay = now + Config::DisplayInterval;
         }
-        std::this_thread::sleep_for(specialAimMode == SpecialAimMode::None ? Config::IdleLoopInterval : Config::ActiveLoopInterval);
+        auto loopInterval = std::chrono::duration_cast<std::chrono::microseconds>(
+            specialAimMode == SpecialAimMode::None ? Config::IdleLoopInterval : Config::ActiveLoopInterval);
+        if (arguments->boxes) loopInterval = std::min(loopInterval, Config::BoxRefreshInterval);
+        std::this_thread::sleep_for(loopInterval);
     }
     if (!arguments->readOnly && lastWorld != 0) Unreal::clearAimOffsets(process, lastWorld);
     if (!arguments->readOnly && arguments->chams) {
         const Unreal::HighlightResult restored = Unreal::restorePlayerHighlights(process);
         std::cout << "\nrestored player highlights=" << restored.restored << " failed=" << restored.failed << '\n';
     }
+    boxOverlay.stop();
     std::cout << '\n';
     return 0;
 }
