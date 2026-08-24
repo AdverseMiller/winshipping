@@ -4,6 +4,7 @@
 #include "box_stream_protocol.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cerrno>
 #include <csignal>
@@ -11,19 +12,36 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <string>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 
 namespace {
 
-constexpr const char* DefaultLauncher = "/home/andrew/programs/vm/vgk/tools/tu104-bar1-overlay/render-current-pool.sh";
 // NVIDIA format 0xd1 is A2B10G10R10: R occupies bits 0..9, G 10..19,
 // B 20..29, and the two alpha bits are 30..31.
 constexpr std::uint32_t VisibleColor = 0xC00FFC00U;
 constexpr std::uint32_t OccludedColor = 0xC00003FFU;
 constexpr std::uint32_t ContrastColor = 0xC0000000U;
 constexpr std::uint16_t ContrastMargin = 2;
+
+std::string defaultLauncher() {
+    std::array<char, 4096> executablePath{};
+    const ssize_t length = readlink("/proc/self/exe", executablePath.data(), executablePath.size() - 1);
+    if (length <= 0) return "render-current-pool.sh";
+    executablePath[static_cast<std::size_t>(length)] = '\0';
+    std::string path(executablePath.data());
+    const std::size_t executableSeparator = path.rfind('/');
+    if (executableSeparator == std::string::npos) return "render-current-pool.sh";
+    path.resize(executableSeparator);
+    const std::size_t buildSeparator = path.rfind('/');
+    if (buildSeparator == std::string::npos) return "render-current-pool.sh";
+    path.resize(buildSeparator);
+    path += "/tools/tu104-bar1-overlay/render-current-pool.sh";
+    if (access(path.c_str(), X_OK) == 0) return path;
+    return "render-current-pool.sh";
+}
 
 }
 
@@ -53,8 +71,9 @@ bool BoxOverlay::start(std::uint32_t repaintHz) {
         setenv("BAR1_BOX_STREAM", "1", 1);
         setenv("BAR1_HZ", repaintHzText.c_str(), 1);
         const char* configured = std::getenv("WINSHIPPING_BOX_RENDERER");
-        const char* launcher = configured != nullptr && configured[0] != '\0' ? configured : DefaultLauncher;
-        execl(launcher, launcher, static_cast<char*>(nullptr));
+        const std::string launcher = configured != nullptr && configured[0] != '\0' ? configured : defaultLauncher();
+        if (launcher.find('/') == std::string::npos) execlp(launcher.c_str(), launcher.c_str(), static_cast<char*>(nullptr));
+        else execl(launcher.c_str(), launcher.c_str(), static_cast<char*>(nullptr));
         _exit(127);
     }
     close(pipes[0]);
