@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """Resolve an NVIDIA scanout pool from hardware state, without guest scans.
 
-The current write-capable family profile covers Turing/TU10x.  VFIO supplies
+The write-capable family profiles cover Turing/TU10x and Ada/AD10x. VFIO supplies
 PCI/BAR geometry, PMC_BOOT_0 selects the family, and display/BAR1 locations are
 accepted only after structural validation.  It does not depend on nvlddmkm
 virtual addresses, private structure offsets, or a guest-physical-memory scan.
@@ -60,6 +60,40 @@ GPU_PROFILES = (
         "mmu_invalidate": 0xB830B0,
         "instance_pdb_offset": 0x200,
         "instance_limit_offset": 0x208,
+        "zero_instance_limit_uses_bar1_size": False,
+        "page_table_levels": 3,
+        "page_2m": 0x200000,
+        "write_capable": True,
+    },
+    {
+        # AD10x keeps the TU102 virtual-register MMU invalidation path and the
+        # GP10x PDE encoding used here.  GA10x/AD10x additionally allow a
+        # 512 MiB PD1 leaf, but the sparse mapper installs only 2 MiB PDE0
+        # leaves. The scanner still requires unique live display and BAR1
+        # instance validation before it emits a write-capable descriptor.
+        "name": "ada-ad10x-v1",
+        "chipsets": {0x192, 0x193, 0x194, 0x196, 0x197},
+        "pbus_bar0_window": 0x1700,
+        "pramin_offset": 0x700000,
+        "pramin_size": 0x100000,
+        "preferred_display_instance_register": 0x610014,
+        "display_instance_register_range": (0x610000, 0x610100),
+        "display_instance_size": 0x10000,
+        "preferred_method_base": 0x690000,
+        "method_base_range": (0x600000, 0x700000),
+        "bar1_block": 0xB80F40,
+        "bar1_block_range": (0xB80000, 0xB90000),
+        "bar1_bind_status": 0xB80F50,
+        "mmu_invalidate_pdb": 0xB830A0,
+        "mmu_invalidate_upper_pdb": 0xB830A4,
+        "mmu_invalidate": 0xB830B0,
+        "instance_pdb_offset": 0x200,
+        "instance_limit_offset": 0x208,
+        # The AD104 Windows driver leaves the legacy NV_RAMIN_ADR_LIMIT pair
+        # clear for the 16 GiB resizable aperture.  VFIO remains the authority
+        # for the live PCI BAR size, and the renderer independently rechecks
+        # that size before mapping.
+        "zero_instance_limit_uses_bar1_size": True,
         "page_table_levels": 3,
         "page_2m": 0x200000,
         "write_capable": True,
@@ -333,7 +367,8 @@ def display_instance_candidates(hw: Hardware) -> list[tuple[int, int, bytes]]:
 
 
 def resolve_hardware_layout(
-    hw: Hardware, owned_vram_bases: set[int] | None
+    hw: Hardware, owned_vram_bases: set[int] | None,
+    display_channel: int | None,
 ) -> tuple[int, int, int, list[dict[str, int | str]], list[dict[str, int | str]]]:
     successes: list[
         tuple[int, int, int, list[dict[str, int | str]], list[dict[str, int | str]]]
@@ -343,7 +378,8 @@ def resolve_hardware_layout(
         for register, address, instance in display_instance_candidates(hw):
             try:
                 selected_windows, pool = resolve_pool(
-                    windows, ramht_objects(instance), owned_vram_bases
+                    windows, ramht_objects(instance), owned_vram_bases,
+                    display_channel
                 )
             except RuntimeError as error:
                 errors.append(
@@ -397,7 +433,14 @@ def resolve_bar1_block(hw: Hardware) -> tuple[int, int, int, int]:
         except RuntimeError:
             continue
         pdb = struct.unpack_from("<Q", instance, pdb_offset)[0]
-        limit = struct.unpack_from("<Q", instance, limit_offset)[0] + 1
+        raw_limit = struct.unpack_from("<Q", instance, limit_offset)[0]
+        limit = (
+            hw.bar1_region["size"]
+            if raw_limit == 0
+            and register == preferred
+            and bool(profile.get("zero_instance_limit_uses_bar1_size", False))
+            else raw_limit + 1
+        )
         # The low PDB bits contain instance-block flags; the renderer masks
         # them before walking.  Requiring raw 4 KiB alignment would reject the
         # valid TU104 encoding.
@@ -456,6 +499,7 @@ def resolve_pool(
     windows: list[dict[str, int | str]],
     objects: list[dict[str, int | str]],
     owned_vram_bases: set[int] | None,
+    display_channel: int | None,
 ) -> tuple[list[dict[str, int | str]], list[dict[str, int | str]]]:
     pools: list[tuple[dict[str, int | str], list[dict[str, int | str]]]] = []
     for window in windows:
@@ -470,6 +514,11 @@ def resolve_pool(
         unique_bases = {obj["allocation_base"] for obj in matches}
         if len(matches) >= 2 and len(matches) == len(unique_bases):
             pools.append((window, matches))
+    if display_channel is not None:
+        pools = [
+            pool for pool in pools
+            if int(pool[0]["display_channel"]) == display_channel
+        ]
     summary = [
         {
             "window": pool[0]["window"],
@@ -530,6 +579,11 @@ def main() -> int:
         type=lambda value: int(value, 0),
         help="WDDM-owned resident allocation base; repeat for all process allocations",
     )
+    parser.add_argument(
+        "--display-channel",
+        type=int,
+        help="select one structurally validated display channel",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -541,7 +595,7 @@ def main() -> int:
             set(args.owned_vram_base) if args.owned_vram_base is not None else None
         )
         method_base, display_instance_register, display_instance, selected_windows, pool = (
-            resolve_hardware_layout(hw, owned_vram_bases)
+            resolve_hardware_layout(hw, owned_vram_bases, args.display_channel)
         )
         bar1_block, bar1_instance, bar1_pdb, bar1_limit = resolve_bar1_block(hw)
         bases = [int(str(obj["allocation_base"]), 0) for obj in pool]

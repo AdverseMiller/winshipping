@@ -7,14 +7,14 @@
 
 namespace Config {
 
-inline constexpr std::uint16_t BoxScreenWidth = 1920;
-inline constexpr std::uint16_t BoxScreenHeight = 1080;
+inline constexpr std::uint16_t BoxScreenWidth = 2560;
+inline constexpr std::uint16_t BoxScreenHeight = 1440;
 inline constexpr std::uint32_t DefaultBoxRepaintHz = 2000;
 
 // Fill this in with the Windows executable name before running the program.
 inline constexpr std::string_view TargetProcessName = "FortniteClient-Win64-Shipping.exe";
 
-inline constexpr std::string_view QemuTarget = "win-gaming";
+inline constexpr std::string_view QemuTarget = "win11";
 inline constexpr std::chrono::milliseconds DisplayInterval{200};
 inline constexpr std::chrono::milliseconds ActorRefreshInterval{16};
 inline constexpr std::chrono::milliseconds BoxAnchorRefreshInterval{4};

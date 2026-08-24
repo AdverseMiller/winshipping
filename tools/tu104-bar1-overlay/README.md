@@ -10,7 +10,7 @@ block-linear scanout allocations and writes a solid test rectangle without a
 guest process, per-frame PRAMIN switching, detiling, allocation, or semantic
 driver scan.
 
-The mapping operation must run while `win-gaming` is suspended. It replaces
+The mapping operation must run while `win11` is suspended. It replaces
 only invalid/sparse 2 MiB BAR1 PDEs, saves their exact original 128-bit values,
 invalidates the BAR1 TLB, and can restore those values exactly. Rendering runs
 while the VM is live.
@@ -51,10 +51,12 @@ BAR0 or whose instance-reported BAR1 limit differs from VFIO.
 
 MMU invalidation registers, instance-field offsets, page-table depth, and the
 block-linear swizzle cannot be safely inferred by passive MMIO scanning. Those
-remain explicit family-profile data. `turing-tu10x-v1` currently covers known
-TU102/TU104/TU106/TU116/TU117 chipset IDs and fails closed on other families.
-An Ampere or Ada port therefore adds a validated data profile instead of
-forking the scanner/renderer. The WC helper now accepts any NVIDIA display
+remain explicit family-profile data. `turing-tu10x-v1` covers known
+TU102/TU104/TU106/TU116/TU117 chipset IDs, while `ada-ad10x-v1` covers
+AD102/AD103/AD104/AD106/AD107. The Ada profile handles the clear legacy
+`NV_RAMIN_ADR_LIMIT` field used with a large resizable BAR by validating the
+live VFIO BAR1 size independently. Unsupported families still fail closed.
+The WC helper now accepts any NVIDIA display
 function bound to `vfio-pci` with a prefetchable BAR1 of at least 256 MiB; its
 device-node name remains `/dev/tu104-bar1-wc` for compatibility.
 Environment overrides are `BAR1_RECT`, `BAR1_COLOR`, `BAR1_HZ`, and

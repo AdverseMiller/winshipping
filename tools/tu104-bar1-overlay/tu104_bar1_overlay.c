@@ -411,7 +411,13 @@ static void locate_pd0(struct device *dev, uint64_t *instance_out,
     memcpy(&pdb, inst + dev->hw.instance_pdb_offset, sizeof(pdb));
     memcpy(&limit, inst + dev->hw.instance_limit_offset, sizeof(limit));
     free(inst);
-    limit++;
+    /* AD10x leaves the legacy NV_RAMIN_ADR_LIMIT pair clear for a large
+     * resizable BAR1.  The live VFIO region is authoritative in that case;
+     * all older profiles retain the encoded-limit check. */
+    if (limit == 0 && dev->hw.chipset >= 0x190u && dev->hw.chipset <= 0x19fu)
+        limit = dev->bar1_size;
+    else
+        limit++;
     if (limit != dev->bar1_size) {
         fprintf(stderr, "BAR1 instance limit 0x%" PRIx64
                         " differs from VFIO size 0x%" PRIx64 "\n",

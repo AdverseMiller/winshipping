@@ -1,56 +1,56 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-directory=${0:A:h}
-binary=$directory/tu104-bar1-overlay
-scanner=${BAR1_SCANNER:-$directory/../tu104-scanout-pool.py}
-probe=${BAR1_WDDM_PROBE:-$directory/../memflow-live-probe}
-state=/run/tu104-bar1-game.state
-domain=${BAR1_DOMAIN:-win-gaming}
-pid_file=${BAR1_QEMU_PID_FILE:-/run/libvirt/qemu/$domain.pid}
+directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+binary="$directory/tu104-bar1-overlay"
+scanner=${BAR1_SCANNER:-"$directory/../tu104-scanout-pool.py"}
+probe=${BAR1_WDDM_PROBE:-"$directory/../memflow-live-probe"}
+domain=${BAR1_DOMAIN:-win11}
+state=${BAR1_STATE:-"/run/tu104-bar1-${domain}.state"}
+pid_file=${BAR1_QEMU_PID_FILE:-"/run/libvirt/qemu/${domain}.pid"}
 virsh=${BAR1_VIRSH:-$(command -v virsh || true)}
 target_process=${BAR1_TARGET_PROCESS:-FortniteClient}
+display_channel=${BAR1_DISPLAY_CHANNEL:-}
 
 if (( EUID != 0 )); then
   if [[ -x /bin/csu ]]; then
     exec /bin/csu "$0" "$@"
-  elif (( $+commands[pkexec] )); then
+  elif command -v pkexec >/dev/null; then
     exec pkexec "$0" "$@"
-  elif (( $+commands[sudo] )); then
+  elif command -v sudo >/dev/null; then
     exec sudo "$0" "$@"
   else
-    print -u2 "root access is required and csu, pkexec, and sudo are unavailable"
+    echo "root access is required and csu, pkexec, and sudo are unavailable" >&2
     exit 1
   fi
 fi
 
-[[ -x $binary ]] || { print -u2 "renderer is not built: $binary"; exit 1; }
-[[ -x $scanner ]] || { print -u2 "hardware scanner is unavailable: $scanner"; exit 1; }
-[[ -x $probe ]] || { print -u2 "WDDM ownership probe is unavailable: $probe"; exit 1; }
-[[ -x $virsh ]] || { print -u2 "virsh is unavailable; set BAR1_VIRSH"; exit 1; }
-[[ -r $pid_file ]] || { print -u2 "$domain PID file is unavailable"; exit 1; }
+for dependency in "$binary" "$scanner" "$probe"; do
+  [[ -x $dependency ]] || { echo "required overlay tool is unavailable: $dependency" >&2; exit 1; }
+done
+[[ -x $virsh ]] || { echo "virsh is unavailable; set BAR1_VIRSH" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+[[ -r $pid_file ]] || { echo "$domain PID file is unavailable" >&2; exit 1; }
 
-qemu_pid=$(<$pid_file)
-[[ $qemu_pid == <1-> ]] || { print -u2 "invalid QEMU PID"; exit 1; }
+qemu_pid=$(<"$pid_file")
+[[ $qemu_pid =~ ^[1-9][0-9]*$ ]] || { echo "invalid QEMU PID" >&2; exit 1; }
 
-# Resolve the live NVIDIA display-function VFIO cdev from QEMU fdinfo. This is
-# stable across QEMU fd-number churn and rejects audio/USB functions.
 vfio_fd=${BAR1_VFIO_FD:-}
 if [[ -z $vfio_fd ]]; then
   vfio_candidates=()
-  for info in /proc/$qemu_pid/fdinfo/*; do
+  for info in /proc/"$qemu_pid"/fdinfo/*; do
     syspath=$(sed -n 's/^vfio-device-syspath: //p' "$info")
     [[ -n $syspath && -r $syspath/vendor && -r $syspath/class ]] || continue
-    vendor=$(<$syspath/vendor)
-    class=$(<$syspath/class)
+    vendor=$(<"$syspath/vendor")
+    class=$(<"$syspath/class")
     [[ $vendor == 0x10de && $class == 0x03* ]] || continue
-    vfio_candidates+=("${info:t}")
+    vfio_candidates+=("${info##*/}")
   done
-  (( ${#vfio_candidates} == 1 )) || {
-    print -u2 "expected one NVIDIA display VFIO fd, got: ${vfio_candidates[*]:-(none)}"
+  (( ${#vfio_candidates[@]} == 1 )) || {
+    echo "expected one NVIDIA display VFIO fd, got: ${vfio_candidates[*]:-(none)}" >&2
     exit 1
   }
-  vfio_fd=$vfio_candidates[1]
+  vfio_fd=${vfio_candidates[0]}
 fi
 
 rect=${BAR1_RECT:-900,450,96,96}
@@ -64,9 +64,9 @@ if [[ ${BAR1_BOX_STREAM:-0} == 1 ]]; then
   stream_args=(--rect-stream-fd 0)
 fi
 
-initial_state=$("$virsh" --connect qemu:///system domstate "$domain")
+initial_state=$($virsh --connect qemu:///system domstate "$domain")
 [[ $initial_state == running || $initial_state == paused ]] || {
-  print -u2 "$domain must be running or paused (state: $initial_state)"
+  echo "$domain must be running or paused (state: $initial_state)" >&2
   exit 1
 }
 suspended_by_us=0
@@ -82,77 +82,85 @@ if [[ $initial_state == running ]]; then
   suspended_by_us=1
 fi
 
-# Correlate exact process-owned VidMm allocations to the hardware RAMHT plane.
-# Both snapshots are taken while paused, so allocation and scanout state cannot
-# race each other.
-owner_json=$("$probe" wddm-allocations "$target_process" --json)
-owned_values=("${(@f)$(jq -er '.resident_allocations[].resident_address' <<<"$owner_json")}")
-(( ${#owned_values} )) || { print -u2 "no resident WDDM allocations for $target_process"; exit 1; }
+owner_json=$("$probe" --target "$domain" wddm-allocations "$target_process" --json)
+mapfile -t owned_values < <(python3 -c '
+import json, sys
+for item in json.load(sys.stdin)["resident_allocations"]:
+    print(item["resident_address"])
+' <<<"$owner_json")
+(( ${#owned_values[@]} )) || { echo "no resident WDDM allocations for $target_process" >&2; exit 1; }
 owner_args=()
 for base in "${owned_values[@]}"; do
   owner_args+=(--owned-vram-base "$base")
 done
+channel_args=()
+if [[ -n $display_channel ]]; then
+  channel_args=(--display-channel "$display_channel")
+fi
 
 pool_json=$("$scanner" --pid "$qemu_pid" --fd "$vfio_fd" \
-  --allow-pramin-switch "${owner_args[@]}")
-jq -e '
-  . as $root |
-  .hardware.schema_version == 1 and
-  .hardware.write_capable == true and
-  .hardware.validation.display_layout == "structural-unique" and
-  .hardware.validation.bar1_instance == "structural-unique" and
-  .hardware.page_table.page_2m == 2097152 and
-  .mode == "hardware-structural-signatures+wddm-process-ownership" and
-  (.windows | length) == 1 and
-  (.surface_pool | length) >= 2 and
-  .windows[0].bytes_per_pixel == 4 and
-  .windows[0].format == "0xd1" and
-  .windows[0].surface_offset_bytes == 0 and
-  ([.surface_pool[].display_channel] | unique | length) == 1 and
-  ([.surface_pool[].allocation_base] | unique | length) == (.surface_pool | length) and
-  all(.surface_pool[]; .target == 1 and .kind == 1 and
-      .allocation_size >= $root.windows[0].required_bytes)
-' <<<"$pool_json" >/dev/null || {
-  print -u2 "owned hardware plane failed renderer invariants"
-  exit 1
-}
+  --allow-pramin-switch "${channel_args[@]}" "${owner_args[@]}")
+mapfile -t descriptor < <(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+h = d["hardware"]
+wins = d["windows"]
+pool = d["surface_pool"]
+assert h["schema_version"] == 1 and h["write_capable"] is True
+assert h["validation"]["display_layout"] == "structural-unique"
+assert h["validation"]["bar1_instance"] == "structural-unique"
+assert h["page_table"]["page_2m"] == 2097152
+assert d["mode"] == "hardware-structural-signatures+wddm-process-ownership"
+assert len(wins) == 1 and len(pool) >= 2
+w = wins[0]
+assert w["bytes_per_pixel"] == 4
+assert w["format"] in {"0xcf", "0xe6", "0xd5", "0xf9", "0xdf", "0xd1"}
+assert w["surface_offset_bytes"] == 0
+assert len({item["display_channel"] for item in pool}) == 1
+assert len({item["allocation_base"] for item in pool}) == len(pool)
+assert all(item["target"] == 1 and item["kind"] == 1 and
+           item["allocation_size"] >= w["required_bytes"] for item in pool)
+values = [
+    w["required_bytes"], w["width"], w["height"], w["pitch_blocks"],
+    w["log2_gobs_per_block_y"], h["pci"]["device_id"], h["chipset"],
+    h["registers"]["pbus_bar0_window"], h["registers"]["pramin_offset"],
+    h["registers"]["pramin_size"], h["registers"]["bar1_block"],
+    h["registers"]["bar1_bind_status"], h["registers"]["mmu_invalidate_pdb"],
+    h["registers"]["mmu_invalidate_upper_pdb"], h["registers"]["mmu_invalidate"],
+    h["page_table"]["instance_pdb_offset"], h["page_table"]["instance_limit_offset"],
+    h["page_table"]["levels"],
+]
+for value in values:
+    print(value)
+for item in pool:
+    print(item["allocation_base"])
+' <<<"$pool_json") || { echo "owned hardware plane failed renderer invariants" >&2; exit 1; }
+(( ${#descriptor[@]} >= 20 )) || { echo "incomplete hardware descriptor" >&2; exit 1; }
 
-surface_size=$(jq -er '.windows[0].required_bytes' <<<"$pool_json")
-frame_width=$(jq -er '.windows[0].width' <<<"$pool_json")
-frame_height=$(jq -er '.windows[0].height' <<<"$pool_json")
-pitch_blocks=$(jq -er '.windows[0].pitch_blocks' <<<"$pool_json")
-log2_gobs_y=$(jq -er '.windows[0].log2_gobs_per_block_y' <<<"$pool_json")
-surface_values=("${(@f)$(jq -er '.surface_pool[].allocation_base' <<<"$pool_json")}")
-surface_args=()
-for surface in "${surface_values[@]}"; do
-  surface_args+=(--surface "$surface")
-done
-
-# Pass the structurally validated transport descriptor to the renderer.  The
-# C binary independently queries VFIO BAR sizes and verifies the live BAR1
-# hierarchy before it can touch a page-table entry.
+surface_size=${descriptor[0]}
+frame_width=${descriptor[1]}
+frame_height=${descriptor[2]}
+pitch_blocks=${descriptor[3]}
+log2_gobs_y=${descriptor[4]}
 hardware_args=(
-  --pci-device-id $(jq -er '.hardware.pci.device_id' <<<"$pool_json")
-  --chipset $(jq -er '.hardware.chipset' <<<"$pool_json")
-  --pbus-bar0-window $(jq -er '.hardware.registers.pbus_bar0_window' <<<"$pool_json")
-  --pramin-offset $(jq -er '.hardware.registers.pramin_offset' <<<"$pool_json")
-  --pramin-size $(jq -er '.hardware.registers.pramin_size' <<<"$pool_json")
-  --bar1-block $(jq -er '.hardware.registers.bar1_block' <<<"$pool_json")
-  --bar1-bind-status $(jq -er '.hardware.registers.bar1_bind_status' <<<"$pool_json")
-  --mmu-invalidate-pdb $(jq -er '.hardware.registers.mmu_invalidate_pdb' <<<"$pool_json")
-  --mmu-invalidate-upper-pdb $(jq -er '.hardware.registers.mmu_invalidate_upper_pdb' <<<"$pool_json")
-  --mmu-invalidate $(jq -er '.hardware.registers.mmu_invalidate' <<<"$pool_json")
-  --instance-pdb-offset $(jq -er '.hardware.page_table.instance_pdb_offset' <<<"$pool_json")
-  --instance-limit-offset $(jq -er '.hardware.page_table.instance_limit_offset' <<<"$pool_json")
-  --page-table-levels $(jq -er '.hardware.page_table.levels' <<<"$pool_json")
+  --pci-device-id "${descriptor[5]}" --chipset "${descriptor[6]}"
+  --pbus-bar0-window "${descriptor[7]}" --pramin-offset "${descriptor[8]}"
+  --pramin-size "${descriptor[9]}" --bar1-block "${descriptor[10]}"
+  --bar1-bind-status "${descriptor[11]}" --mmu-invalidate-pdb "${descriptor[12]}"
+  --mmu-invalidate-upper-pdb "${descriptor[13]}" --mmu-invalidate "${descriptor[14]}"
+  --instance-pdb-offset "${descriptor[15]}" --instance-limit-offset "${descriptor[16]}"
+  --page-table-levels "${descriptor[17]}"
 )
+surface_args=()
+for (( index=18; index<${#descriptor[@]}; ++index )); do
+  surface_args+=(--surface "${descriptor[index]}")
+done
 
 mapping_args=(--pid "$qemu_pid" --vfio-fd "$vfio_fd" --state "$state"
   "${hardware_args[@]}" "${surface_args[@]}" --surface-size "$surface_size")
-
 if [[ -e $state ]]; then
   if ! "$binary" verify-sparse "${mapping_args[@]}"; then
-    print -u2 "surface ownership changed; replacing the stale sparse mapping"
+    echo "surface ownership changed; replacing the stale sparse mapping" >&2
     "$binary" restore-sparse "${mapping_args[@]}"
     "$binary" install-sparse "${mapping_args[@]}"
   fi
